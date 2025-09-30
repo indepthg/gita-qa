@@ -46,14 +46,24 @@ const GitaWidget = (() => {
     const send = el('button', { style: { padding: '10px 14px', borderRadius: '6px', border: '1px solid #e07a00', background: '#ff8d1a', color: '#fff', cursor: 'pointer' } }, 'Ask');
     const clear = el('button', { style: { padding: '10px 14px', borderRadius: '6px', border: '1px solid #ddd', background: '#fafafa', cursor: 'pointer' } }, 'Clear');
 
-    function pushMessage(role, text, citations) {
+    function pushMessage(role, payload, citations) {
       const line = el('div');
-      const tag = role === 'user' ? 'You: ' : 'Answer: ';
-      const t = el('div', {}, tag + (text || ''));
-      line.appendChild(t);
-      if (citations && citations.length) {
-        const c = el('div', { style: { fontSize: '12px', color: '#666' } }, citations.join(' '));
-        line.appendChild(c);
+      if (role === 'user') {
+        line.appendChild(el('div', {}, 'You: ' + payload));
+      } else {
+        // If it's our rich explain payload, render fields
+        if (payload && typeof payload === 'object' && payload.mode === 'explain') {
+          const order = ['title','sanskrit','roman','colloquial','translation','word_meanings','summary'];
+          order.forEach(k => {
+            if (payload[k]) line.appendChild(el('div', {}, payload[k]));
+          });
+        } else {
+          const txt = (payload && payload.answer) ? payload.answer : (typeof payload === 'string' ? payload : '');
+          line.appendChild(el('div', {}, 'Answer: ' + (txt || '')));
+        }
+        if (citations && citations.length) {
+          line.appendChild(el('div', { style: { fontSize: '12px', color: '#666' } }, citations.join(' ')));
+        }
       }
       log.appendChild(line);
       log.scrollTop = log.scrollHeight;
@@ -67,7 +77,7 @@ const GitaWidget = (() => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ question: q, topic: 'gita' })
         });
-        pushMessage('bot', data.answer, data.citations);
+        pushMessage('bot', data, data.citations);
       } catch (e) {
         pushMessage('bot', 'Error: ' + (e.message || e));
       }
