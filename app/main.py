@@ -1,4 +1,3 @@
-
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -106,7 +105,6 @@ async def debug_stats():
 
 @app.get("/suggest")
 async def suggest():
-    # session-agnostic starter pills
     return {
         "suggestions": [
             "Explain 2:47",
@@ -118,8 +116,6 @@ async def suggest():
         ]
     }
 
-
-# --- ASK routing helpers ---
 
 def _extract_ch_verse(text: str) -> Optional[Tuple[int,int]]:
     m = RE_CV.search(text)
@@ -152,14 +148,12 @@ def _summarize(prompt: str) -> str:
 def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int,int,Dict]]:
     results = []
     seen = set()
-    # FTS first
     for r in fts_rows:
         key = (int(r["chapter"]), int(r["verse"]))
         if key in seen:
             continue
         seen.add(key)
         results.append((key[0], key[1], dict(r)))
-    # Embedding next
     if embed_hits and embed_hits.get("metadatas"):
         for metas in embed_hits["metadatas"]:
             for m in metas:
@@ -182,8 +176,6 @@ async def ask(payload: AskPayload):
         raise HTTPException(status_code=400, detail="Empty question")
 
     topic = payload.topic or TOPIC_DEFAULT
-
-    # Direct verse?
     cv = _extract_ch_verse(q)
     conn = get_conn()
 
@@ -191,7 +183,6 @@ async def ask(payload: AskPayload):
         ch, v = cv
         row = fetch_exact(conn, ch, v)
         if not row:
-            # fallback to FTS for this CV string
             fts_rows = search_fts(conn, f"{ch}:{v}", limit=5)
             if not fts_rows:
                 return {"answer": NO_MATCH_MESSAGE, "citations": []}
@@ -199,53 +190,57 @@ async def ask(payload: AskPayload):
 
         if _is_word_meaning_query(q):
             wm = row["word_meanings"] or ""
-            answer = wm if wm else NO_MATCH_MESSAGE
             return {
                 "mode": "word_meaning",
                 "chapter": ch,
                 "verse": v,
-                "answer": answer,
-                "citations": [f"[{ch}:{v}]"]
-            }
-        else:
-            # explain: base on verse, neighbors, optional brief summary
-            neighbors = fetch_neighbors(conn, ch, v, k=1)
-            parts = []
-            parts.append((ch, v, row["translation"] or ""))
-            for n in neighbors:
-                parts.append((int(n["chapter"]), int(n["verse"]), n["translation"] or ""))
-            context_txt = "\n".join([f"{c}:{vv} {t}".strip() for c, vv, t in parts if t])
-            prompt = (
-                "Summarize the central teaching of this verse in 2-3 plain sentences, "
-                "no formatting, and include the citation [C:V] somewhere in the text.\n\n" + context_txt
-            )
-            summary = _summarize(prompt)
-            answer = summary if summary else (row["translation"] or NO_MATCH_MESSAGE)
-            return {
-                "mode": "explain",
-                "chapter": ch,
-                "verse": v,
-                "answer": answer,
+                "answer": wm if wm else NO_MATCH_MESSAGE,
                 "citations": [f"[{ch}:{v}]"]
             }
 
-    # Broad query: combine FTS + embeddings
+        neighbors = fetch_neighbors(conn, ch, v, k=1)
+        parts = [(ch, v, row["translation"] or "")]
+        for n in neighbors:
+            parts.append((int(n["chapter"]), int(n["verse"]), n["translation"] or ""))
+
+        context_txt = "\n".join([f"{c}:{vv} {t}".strip() for c, vv, t in parts if t])
+        prompt = (
+            "Summarize the central teaching of this verse in 2-3 plain sentences, "
+            "no formatting, and include the citation [C:V] somewhere in the text.\n\n" + context_txt
+        )
+        summary = _summarize(prompt)
+
+        return {
+            "mode": "explain",
+            "chapter": ch,
+            "verse": v,
+            "title": row["title"] or "",
+            "sanskrit": row["sanskrit"] or "",
+            "roman": row["roman"] or "",
+            "colloquial": row["colloquial"] or "",
+            "translation": row["translation"] or "",
+            "word_meanings": row["word_meanings"] or "",
+            "capsule_url": row["capsule_url"] or "",
+            "summary": summary or "",
+            "neighbors": [
+                {"chapter": int(n["chapter"]), "verse": int(n["verse"]), "translation": n["translation"] or ""}
+                for n in neighbors
+            ],
+            "citations": [f"[{ch}:{v}]"]
+        }
+
     fts_rows = search_fts(conn, q, limit=6)
-    
-    emb = None
-    embeddings_used = False
     try:
         emb = embed_store.query(q, top_k=6, where={"topic": topic})
         embeddings_used = True
-    except Exception as e:
-        print("Embedding query failed:", e)
+    except Exception:
+        emb = None
         embeddings_used = False
-    
-    merged = _merge_hits(fts_rows, emb or {})
-    
+
+    merged = _merge_hits(fts_rows, emb)
     if not merged:
-        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "embeddings_used": embeddings_used}
-    
+        return {"answer": NO_MATCH_MESSAGE, "citations": [], "embeddings_used": embeddings_used}
+
     ctx_lines: List[str] = []
     cites: List[str] = []
     for ch, v, data in merged:
@@ -256,19 +251,17 @@ async def ask(payload: AskPayload):
             s = ""
         if s:
             ctx_lines.append(f"{ch}:{v} {s}")
-    
-    ctx = "\n".join(ctx_lines) if ctx_lines else ""
+
+    ctx = "\n".join(ctx_lines)
     prompt = (
         "Answer the question using only the provided context. Keep it concise, plain text, no markup. "
         "Weave in verse citations like [C:V] when relevant.\n\nQuestion: " + q + "\n\nContext:\n" + ctx
     )
-    ans = _summarize(prompt) if ctx else ""
-    
+    ans = _summarize(prompt)
+
     return {
         "mode": "broad",
         "answer": ans if ans else NO_MATCH_MESSAGE,
         "citations": list(dict.fromkeys(cites))[:8],
         "embeddings_used": embeddings_used
     }
-
-
