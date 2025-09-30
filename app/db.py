@@ -3,6 +3,7 @@ import os
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional
 
+# New DB path will be set via env var in Railway. Default stays under /data.
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.getenv("DATA_DIR", "/data"), "gita.db"))
 
 def get_conn() -> sqlite3.Connection:
@@ -11,12 +12,13 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+# Base schema: includes commentary1/2/3 so we can index them in FTS
 SCHEMA_SQL = r"""
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS verses (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY,              -- not required, but handy; rowid still used for FTS joins
   rownum INTEGER,
   audio_id TEXT,
   chapter INTEGER NOT NULL,
@@ -25,6 +27,9 @@ CREATE TABLE IF NOT EXISTS verses (
   roman TEXT,
   colloquial TEXT,
   translation TEXT,
+  commentary1 TEXT,
+  commentary2 TEXT,
+  commentary3 TEXT,
   capsule_url TEXT,
   word_meanings TEXT,
   title TEXT,
@@ -33,6 +38,10 @@ CREATE TABLE IF NOT EXISTS verses (
 """
 
 def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
+    """
+    Create base table and ensure a fresh, contentless FTS index (no triggers).
+    Safe to run on every boot. For old DBs with legacy triggers, switch to a new DB filename.
+    """
     close_after = False
     if conn is None:
         conn = get_conn()
@@ -46,7 +55,10 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             conn.close()
 
 def ensure_fts(conn: sqlite3.Connection) -> None:
-    # Drop and rebuild FTS from current verses (no triggers used)
+    """
+    Drop and rebuild a contentless FTS5 index from current rows in `verses`.
+    We include commentary1/2/3 to improve broad queries without embeddings.
+    """
     conn.executescript("""
     DROP TABLE IF EXISTS verses_fts;
     CREATE VIRTUAL TABLE verses_fts USING fts5(
@@ -55,32 +67,40 @@ def ensure_fts(conn: sqlite3.Connection) -> None:
       word_meanings,
       roman,
       colloquial,
+      commentary1,
+      commentary2,
+      commentary3,
       content='',
       tokenize='unicode61'
     );
     """)
-    # Populate from verses (use rowid to be schema-agnostic)
+    # Populate from verses using rowid (schema-agnostic, works even if id differs)
     conn.execute("""
-    INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
-    SELECT rowid, title, translation, word_meanings, roman, colloquial FROM verses
+    INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial,commentary1,commentary2,commentary3)
+    SELECT rowid, title, translation, word_meanings, roman, colloquial, commentary1, commentary2, commentary3
+    FROM verses
     """)
     conn.commit()
 
-
 def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     sql = (
-        "INSERT INTO verses (rownum,audio_id,chapter,verse,sanskrit,roman,colloquial,translation,capsule_url,word_meanings,title) "
-        "VALUES (:rownum,:audio_id,:chapter,:verse,:sanskrit,:roman,:colloquial,:translation,:capsule_url,:word_meanings,:title) "
+        "INSERT INTO verses (rownum,audio_id,chapter,verse,sanskrit,roman,colloquial,translation,commentary1,commentary2,commentary3,capsule_url,word_meanings,title) "
+        "VALUES (:rownum,:audio_id,:chapter,:verse,:sanskrit,:roman,:colloquial,:translation,:commentary1,:commentary2,:commentary3,:capsule_url,:word_meanings,:title) "
         "ON CONFLICT(chapter,verse) DO UPDATE SET "
         "rownum=excluded.rownum,audio_id=excluded.audio_id,sanskrit=excluded.sanskrit,roman=excluded.roman,"
-        "colloquial=excluded.colloquial,translation=excluded.translation,capsule_url=excluded.capsule_url,"
-        "word_meanings=excluded.word_meanings,title=excluded.title;"
+        "colloquial=excluded.colloquial,translation=excluded.translation,"
+        "commentary1=excluded.commentary1,commentary2=excluded.commentary2,commentary3=excluded.commentary3,"
+        "capsule_url=excluded.capsule_url,word_meanings=excluded.word_meanings,title=excluded.title;"
     )
     conn.execute(sql, row)
 
 def bulk_upsert(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> int:
     count = 0
     for r in rows:
+        # ensure keys exist for commentary fields even if missing in CSV
+        r.setdefault("commentary1", "")
+        r.setdefault("commentary2", "")
+        r.setdefault("commentary3", "")
         upsert_verse(conn, r)
         count += 1
     conn.commit()
@@ -98,6 +118,10 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
     return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
+    """
+    FTS query compatible with runtimes that are strict about MATCH placeholders.
+    We wrap the term in quotes via SQL concatenation to avoid parser errors.
+    """
     q = (q or "").strip()
     if not q:
         return []
