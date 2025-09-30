@@ -59,12 +59,13 @@ def ensure_fts(conn: sqlite3.Connection) -> None:
       tokenize='unicode61'
     );
     """)
-    # Populate from verses
+    # Populate from verses (use rowid to be schema-agnostic)
     conn.execute("""
     INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
-    SELECT id,title,translation,word_meanings,roman,colloquial FROM verses
+    SELECT rowid, title, translation, word_meanings, roman, colloquial FROM verses
     """)
     conn.commit()
+
 
 def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     sql = (
