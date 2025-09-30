@@ -1,9 +1,8 @@
-
 import os
+import re
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional
 
-# New DB path will be set via env var in Railway. Default stays under /data.
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.getenv("DATA_DIR", "/data"), "gita.db"))
 
 def get_conn() -> sqlite3.Connection:
@@ -12,13 +11,12 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-# Base schema: includes commentary1/2/3 so we can index them in FTS
 SCHEMA_SQL = r"""
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS verses (
-  id INTEGER PRIMARY KEY,              -- not required, but handy; rowid still used for FTS joins
+  id INTEGER PRIMARY KEY,
   rownum INTEGER,
   audio_id TEXT,
   chapter INTEGER NOT NULL,
@@ -38,10 +36,6 @@ CREATE TABLE IF NOT EXISTS verses (
 """
 
 def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
-    """
-    Create base table and ensure a fresh, contentless FTS index (no triggers).
-    Safe to run on every boot. For old DBs with legacy triggers, switch to a new DB filename.
-    """
     close_after = False
     if conn is None:
         conn = get_conn()
@@ -54,72 +48,33 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         if close_after:
             conn.close()
 
-import re
-import sqlite3
+# ---------- FTS helpers ----------
 
-# allow letters/digits/space + common FTS operators/symbols
 _FTS_SAFE = re.compile(r"[^A-Za-z0-9\s:\"'\-\(\)\/\.\*\+\|]")
 
 def _fts_sanitize(q: str) -> str:
     q = (q or "").strip()
     if not q:
         return ""
-    # Uppercase boolean operators so FTS recognizes them
     q = re.sub(r"\b(or|and|not|near)\b", lambda m: m.group(1).upper(), q, flags=re.IGNORECASE)
-    # Remove unsafe chars
     q = _FTS_SAFE.sub(" ", q)
-    # Collapse whitespace
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
 def ensure_fts(conn: sqlite3.Connection) -> None:
-    """
-    Drop & rebuild a contentless FTS5 index from current rows in `verses`.
-    Dynamically includes commentary1/2/3 if present.
-    """
-    # Which columns exist?
-    cols = [r["name"] for r in conn.execute("PRAGMA table_info(verses)")]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(verses)").fetchall()]
     fts_cols = ["title", "translation", "word_meanings", "roman", "colloquial"]
     for c in ("commentary1", "commentary2", "commentary3"):
         if c in cols:
             fts_cols.append(c)
 
-    # Recreate FTS table
     conn.execute("DROP TABLE IF EXISTS verses_fts")
     col_defs = ",\n  ".join(fts_cols)
-    conn.execute(
-        f"CREATE VIRTUAL TABLE verses_fts USING fts5(\n  {col_defs},\n  content='',\n  tokenize='unicode61'\n)"
-    )
+    conn.execute(f"CREATE VIRTUAL TABLE verses_fts USING fts5(\n  {col_defs},\n  content='',\n  tokenize='unicode61'\n)")
 
-    # Populate from verses using rowid (works whether or not you have an 'id' column)
     col_csv = ",".join(fts_cols)
-    conn.execute(
-        f"INSERT INTO verses_fts(rowid,{col_csv}) SELECT rowid,{col_csv} FROM verses"
-    )
+    conn.execute(f"INSERT INTO verses_fts(rowid,{col_csv}) SELECT rowid,{col_csv} FROM verses")
     conn.commit()
-
-def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10):
-    """
-    FTS query that supports operators (OR/NEAR/quotes) without using MATCH ?,
-    which some SQLite builds reject. We sanitize and inline the literal safely.
-    """
-    q2 = _fts_sanitize(q)
-    if not q2:
-        return []
-
-    # Safely inline as a single-quoted SQL literal
-    q_lit = "'" + q2.replace("'", "''") + "'"
-
-    sql = f"""
-        SELECT v.*
-        FROM verses_fts
-        JOIN verses AS v ON v.rowid = verses_fts.rowid
-        WHERE verses_fts MATCH {q_lit}
-        LIMIT ?
-    """
-    cur = conn.execute(sql, (limit,))
-    return cur.fetchall()
-
 
 def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     sql = (
@@ -136,7 +91,6 @@ def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
 def bulk_upsert(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> int:
     count = 0
     for r in rows:
-        # ensure keys exist for commentary fields even if missing in CSV
         r.setdefault("commentary1", "")
         r.setdefault("commentary2", "")
         r.setdefault("commentary3", "")
@@ -157,24 +111,17 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
     return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
-    """
-    Allow FTS operators while keeping a parameterized query.
-    Trick: concatenate with an empty string so MATCH sees a literal string,
-    but we don't force quotes (so OR/NEAR/NOT still work).
-    """
-    q = (q or "").strip()
-    if not q:
+    q2 = _fts_sanitize(q)
+    if not q2:
         return []
-    cur = conn.execute(
-        """
-        SELECT v.*
+    q_lit = "'" + q2.replace("'", "''") + "'"
+    sql = f"""        SELECT v.*
         FROM verses_fts
         JOIN verses AS v ON v.rowid = verses_fts.rowid
-        WHERE verses_fts MATCH ('' || ?)
+        WHERE verses_fts MATCH {q_lit}
         LIMIT ?
-        """,
-        (q, limit),
-    )
+    """
+    cur = conn.execute(sql, (limit,))
     return cur.fetchall()
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
