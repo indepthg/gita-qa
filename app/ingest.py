@@ -1,31 +1,28 @@
 
 import io
-import math
 import os
 import re
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from pypdf import PdfReader
 from docx import Document
 
-from .db import bulk_upsert
+from .db import bulk_upsert, ensure_fts
 from . import embed_store
 
-RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")  # 1-18 : 1-99
+RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
 
 REQUIRED_COLS = [
     "rownum","audio_id","chapter","verse","sanskrit","roman","colloquial",
     "translation","capsule_url","word_meanings","title"
 ]
 
-
 def _coerce_int(x):
     try:
         return int(str(x).strip())
     except Exception:
         return None
-
 
 def load_sheet_to_rows(file_bytes: bytes, filename: str) -> List[Dict]:
     name = filename.lower()
@@ -46,7 +43,7 @@ def load_sheet_to_rows(file_bytes: bytes, filename: str) -> List[Dict]:
         chap = _coerce_int(r[cols["chapter"]])
         ver = _coerce_int(r[cols["verse"]])
         if chap is None or ver is None:
-            continue  # skip malformed
+            continue
         out.append({
             "rownum": _coerce_int(r[cols["rownum"]]),
             "audio_id": str(r.get(cols["audio_id"], "") or ""),
@@ -62,7 +59,6 @@ def load_sheet_to_rows(file_bytes: bytes, filename: str) -> List[Dict]:
         })
     return out
 
-
 def _chunk_text(txt: str, size: int = 1000, overlap: int = 120) -> List[str]:
     txt = txt.replace("\r", "\n")
     parts: List[str] = []
@@ -75,50 +71,40 @@ def _chunk_text(txt: str, size: int = 1000, overlap: int = 120) -> List[str]:
             i = 0
     return parts
 
-
 def _infer_cv(text: str) -> Tuple[int, int]:
     m = RE_CV.search(text)
     if not m:
         return (0, 0)
-    chap = int(m.group(1))
-    ver = int(m.group(2))
-    return (chap, ver)
+    return int(m.group(1)), int(m.group(2))
 
-
-def pdf_to_chunks(file_bytes: bytes) -> List[Tuple[str, Dict]]:
+def pdf_to_chunks(file_bytes: bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
-    chunks: List[Tuple[str, Dict]] = []
     for i, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
         for chunk in _chunk_text(text):
             ch, v = _infer_cv(chunk)
-            chunks.append((chunk, {"page": i, "chapter": ch, "verse": v}))
-    return chunks
+            yield chunk, {"page": i, "chapter": ch, "verse": v}
 
-
-def docx_to_chunks(file_bytes: bytes) -> List[Tuple[str, Dict]]:
+def docx_to_chunks(file_bytes: bytes):
     doc = Document(io.BytesIO(file_bytes))
     text = "\n".join([p.text for p in doc.paragraphs])
-    chunks: List[Tuple[str, Dict]] = []
     for chunk in _chunk_text(text):
         ch, v = _infer_cv(chunk)
-        chunks.append((chunk, {"page": None, "chapter": ch, "verse": v}))
-    return chunks
-
+        yield chunk, {"page": None, "chapter": ch, "verse": v}
 
 def ingest_commentary(file_bytes: bytes, filename: str, topic: str, commentator: str, source: str) -> int:
     name = filename.lower()
     if name.endswith(".pdf"):
-        kv = pdf_to_chunks(file_bytes)
+        kv = list(pdf_to_chunks(file_bytes))
     elif name.endswith(".docx"):
-        kv = docx_to_chunks(file_bytes)
+        kv = list(docx_to_chunks(file_bytes))
     else:
         raise ValueError("Unsupported commentary format. Use PDF or DOCX.")
 
     docs = [k for k, _ in kv]
-    metas = []
-    for _, meta in kv:
-        m = {**meta, "topic": topic, "commentator": commentator, "source": source}
-        metas.append(m)
-
+    metas = [{**meta, "topic": topic, "commentator": commentator, "source": source} for _, meta in kv]
     return embed_store.add_chunks(docs, metas)
+
+# New: helper to rebuild FTS after CSV ingest
+def finalize_ingest(conn):
+    ensure_fts(conn)
