@@ -55,15 +55,16 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             conn.close()
 
 import re
+import sqlite3
 
-# allow letters/digits/space and common FTS operators/symbols
+# allow letters/digits/space + common FTS operators/symbols
 _FTS_SAFE = re.compile(r"[^A-Za-z0-9\s:\"'\-\(\)\/\.\*\+\|]")
 
 def _fts_sanitize(q: str) -> str:
     q = (q or "").strip()
     if not q:
         return ""
-    # Uppercase boolean operators (optional)
+    # Uppercase boolean operators so FTS recognizes them
     q = re.sub(r"\b(or|and|not|near)\b", lambda m: m.group(1).upper(), q, flags=re.IGNORECASE)
     # Remove unsafe chars
     q = _FTS_SAFE.sub(" ", q)
@@ -71,16 +72,49 @@ def _fts_sanitize(q: str) -> str:
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
-def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
+def ensure_fts(conn: sqlite3.Connection) -> None:
+    """
+    Drop & rebuild a contentless FTS5 index from current rows in `verses`.
+    Dynamically includes commentary1/2/3 if present.
+    """
+    # Which columns exist?
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(verses)")]
+    fts_cols = ["title", "translation", "word_meanings", "roman", "colloquial"]
+    for c in ("commentary1", "commentary2", "commentary3"):
+        if c in cols:
+            fts_cols.append(c)
+
+    # Recreate FTS table
+    conn.execute("DROP TABLE IF EXISTS verses_fts")
+    col_defs = ",\n  ".join(fts_cols)
+    conn.execute(
+        f"CREATE VIRTUAL TABLE verses_fts USING fts5(\n  {col_defs},\n  content='',\n  tokenize='unicode61'\n)"
+    )
+
+    # Populate from verses using rowid (works whether or not you have an 'id' column)
+    col_csv = ",".join(fts_cols)
+    conn.execute(
+        f"INSERT INTO verses_fts(rowid,{col_csv}) SELECT rowid,{col_csv} FROM verses"
+    )
+    conn.commit()
+
+def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10):
+    """
+    FTS query that supports operators (OR/NEAR/quotes) without using MATCH ?,
+    which some SQLite builds reject. We sanitize and inline the literal safely.
+    """
     q2 = _fts_sanitize(q)
     if not q2:
         return []
-    # IMPORTANT: inline sanitized query because this SQLite build rejects MATCH parameters
+
+    # Safely inline as a single-quoted SQL literal
+    q_lit = "'" + q2.replace("'", "''") + "'"
+
     sql = f"""
         SELECT v.*
         FROM verses_fts
         JOIN verses AS v ON v.rowid = verses_fts.rowid
-        WHERE verses_fts MATCH {sqlite3.escape_string(q2).decode() if hasattr(sqlite3, 'escape_string') else "'" + q2.replace("'", "''") + "'"}
+        WHERE verses_fts MATCH {q_lit}
         LIMIT ?
     """
     cur = conn.execute(sql, (limit,))
