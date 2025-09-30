@@ -1,8 +1,15 @@
+
 import os
 import sqlite3
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.getenv("DATA_DIR", "/data"), "gita.db"))
+
+def get_conn() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 SCHEMA_SQL = r"""
 PRAGMA journal_mode=WAL;
@@ -23,47 +30,7 @@ CREATE TABLE IF NOT EXISTS verses (
   title TEXT,
   UNIQUE(chapter, verse)
 );
-
--- Drop & recreate FTS/triggers each boot to avoid stale definitions
-DROP TRIGGER IF EXISTS verses_ai;
-DROP TRIGGER IF EXISTS verses_ad;
-DROP TRIGGER IF EXISTS verses_au;
-DROP TABLE IF EXISTS verses_fts;
-
-CREATE VIRTUAL TABLE verses_fts USING fts5(
-  title,
-  translation,
-  word_meanings,
-  roman,
-  colloquial,
-  content='verses',
-  content_rowid='id',
-  tokenize='unicode61'
-);
-
-CREATE TRIGGER verses_ai AFTER INSERT ON verses BEGIN
-  INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
-  VALUES(new.id,new.title,new.translation,new.word_meanings,new.roman,new.colloquial);
-END;
-
-CREATE TRIGGER verses_ad AFTER DELETE ON verses BEGIN
-  DELETE FROM verses_fts WHERE rowid=old.id;
-END;
-
-CREATE TRIGGER verses_au AFTER UPDATE ON verses BEGIN
-  DELETE FROM verses_fts WHERE rowid=old.id;
-  INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
-  VALUES(new.id,new.title,new.translation,new.word_meanings,new.roman,new.colloquial);
-END;
 """
-
-
-def get_conn() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 
 def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     close_after = False
@@ -73,10 +40,31 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     try:
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+        ensure_fts(conn)
     finally:
         if close_after:
             conn.close()
 
+def ensure_fts(conn: sqlite3.Connection) -> None:
+    # Drop and rebuild FTS from current verses (no triggers used)
+    conn.executescript("""
+    DROP TABLE IF EXISTS verses_fts;
+    CREATE VIRTUAL TABLE verses_fts USING fts5(
+      title,
+      translation,
+      word_meanings,
+      roman,
+      colloquial,
+      content='',
+      tokenize='unicode61'
+    );
+    """)
+    # Populate from verses
+    conn.execute("""
+    INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
+    SELECT id,title,translation,word_meanings,roman,colloquial FROM verses
+    """)
+    conn.commit()
 
 def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     sql = (
@@ -89,7 +77,6 @@ def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     )
     conn.execute(sql, row)
 
-
 def bulk_upsert(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> int:
     count = 0
     for r in rows:
@@ -98,20 +85,16 @@ def bulk_upsert(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> int
     conn.commit()
     return count
 
-
 def fetch_exact(conn: sqlite3.Connection, chap: int, ver: int) -> Optional[sqlite3.Row]:
     cur = conn.execute("SELECT * FROM verses WHERE chapter=? AND verse=?", (chap, ver))
     return cur.fetchone()
-
 
 def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -> List[sqlite3.Row]:
     cur = conn.execute(
         "SELECT * FROM verses WHERE chapter=? AND verse BETWEEN ? AND ? ORDER BY verse ASC",
         (chap, max(1, ver - k), ver + k),
     )
-    rows = [r for r in cur.fetchall() if int(r["verse"]) != ver]
-    return rows
-
+    return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
     cur = conn.execute(
@@ -119,7 +102,6 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
         (q, limit),
     )
     return cur.fetchall()
-
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
     v = conn.execute("SELECT COUNT(1) AS c FROM verses").fetchone()["c"]
