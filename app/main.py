@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .db import get_conn, init_db, bulk_upsert, fetch_exact, fetch_neighbors, search_fts, stats
@@ -15,8 +17,9 @@ ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
 GEN_MODEL = os.getenv("GEN_MODEL", "gpt-4o-mini")
 NO_MATCH_MESSAGE = os.getenv("NO_MATCH_MESSAGE", "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.")
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
+USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # set to 1 later to enable embeddings on broad queries
 
-# --- OpenAI client (new SDK style) ---
+# --- OpenAI client ---
 from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -41,6 +44,9 @@ else:
         allow_headers=["*"],
     )
 
+# Serve widget.js at /static/widget.js
+app.mount("/static", StaticFiles(directory="app"), name="static")
+
 # --- Boot DB ---
 init_db()
 
@@ -50,6 +56,85 @@ RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
 class AskPayload(BaseModel):
     question: str
     topic: Optional[str] = None
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Gita Q&A</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <style>
+    :root{
+      --bg:#0b0c0f; --card:#111318; --border:#22252b; --text:#e9e9ec; --muted:#9aa0a6;
+      --pill:#171a20; --pill-border:#2a2e35; --accent:#ff8d1a;
+    }
+    @media (prefers-color-scheme: light) {
+      :root{
+        --bg:#f5f5f7; --card:#ffffff; --border:#e6e6ea; --text:#111; --muted:#5b6068;
+        --pill:#f3f4f6; --pill-border:#e5e7eb; --accent:#ff8d1a;
+      }
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0; background:var(--bg); color:var(--text);
+      font: 15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      display:flex; align-items:stretch; justify-content:center;
+    }
+    .wrap{ width:min(920px, 100%); padding:24px; }
+    .card{
+      background:var(--card); border:1px solid var(--border); border-radius:16px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.12);
+      overflow:hidden;
+    }
+    .head{ display:flex; align-items:baseline; justify-content:space-between; padding:18px 22px; border-bottom:1px solid var(--border); }
+    .title{ font-size:20px; font-weight:700; letter-spacing:.2px; }
+    .topic{ font-size:12px; color:var(--muted); }
+
+    .body{ display:flex; flex-direction:column; gap:12px; padding:14px 22px 8px; }
+    .pills{ display:flex; flex-wrap:wrap; gap:8px; padding:6px 0 2px; }
+    .pills .pill{
+      padding:6px 10px; border-radius:999px; border:1px solid var(--pill-border); background:var(--pill); color:var(--text);
+      cursor:pointer; font-size:12px;
+    }
+
+    .form{ display:flex; gap:10px; align-items:center; padding-top:8px; border-top:1px solid var(--border); margin-top:8px; position:sticky; bottom:0; background:var(--card); }
+    .input{ flex:1; padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:transparent; color:var(--text); outline:none; font-size:15px; }
+    .send{
+      width:42px;height:42px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9999px;
+      background:var(--accent);color:#111;cursor:pointer;font-weight:700;position:relative;flex:0 0 auto;
+      transition: transform .15s ease, opacity .15s ease;
+    }
+    .send:hover{ transform: translateY(-1px); }
+    .send:active{ transform: translateY(0); }
+    .send[disabled]{ opacity:.6; cursor:not-allowed; }
+    .send__svg{ width:20px;height:20px; display:block; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="head">
+        <div class="title">Gita Q&A</div>
+        <div class="topic">Topic: gita</div>
+      </div>
+      <div class="body">
+        <div id="gita"></div>
+      </div>
+    </div>
+  </div>
+  <script src="/static/widget.js"></script>
+  <script>
+    GitaWidget.mount({ root: '#gita', apiBase: '' });
+  </script>
+</body>
+</html>
+    """
 
 
 @app.post("/ingest_sheet_sql")
@@ -229,17 +314,23 @@ async def ask(payload: AskPayload):
             "citations": [f"[{ch}:{v}]"]
         }
 
-    fts_rows = search_fts(conn, q, limit=6)
-    try:
-        emb = embed_store.query(q, top_k=6, where={"topic": topic})
-        embeddings_used = True
-    except Exception:
-        emb = None
-        embeddings_used = False
+    # Broad query: FTS primary; embeddings optional
+    fts_rows = search_fts(conn, q, limit=10)
 
-    merged = _merge_hits(fts_rows, emb)
+    emb = None
+    embeddings_used = False
+    if USE_EMBED:
+        try:
+            emb = embed_store.query(q, top_k=6, where={"topic": topic})
+            embeddings_used = True
+        except Exception as e:
+            print("Embedding query failed:", e)
+            embeddings_used = False
+
+    merged = _merge_hits(fts_rows, emb or {})
+
     if not merged:
-        return {"answer": NO_MATCH_MESSAGE, "citations": [], "embeddings_used": embeddings_used}
+        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "embeddings_used": embeddings_used}
 
     ctx_lines: List[str] = []
     cites: List[str] = []
@@ -247,10 +338,11 @@ async def ask(payload: AskPayload):
         cites.append(f"[{ch}:{v}]")
         if isinstance(data, dict) and "translation" in data:
             s = data.get("translation") or data.get("roman") or data.get("title") or ""
-        else:
-            s = ""
-        if s:
-            ctx_lines.append(f"{ch}:{v} {s}")
+            if s:
+                ctx_lines.append(f"{ch}:{v} {s}")
+
+    if not ctx_lines:
+        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": list(dict.fromkeys(cites))[:8], "embeddings_used": embeddings_used}
 
     ctx = "\n".join(ctx_lines)
     prompt = (
