@@ -50,16 +50,24 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
 
 # ---------- FTS helpers ----------
 
-_FTS_SAFE = re.compile(r"[^A-Za-z0-9\s:\"'\-\(\)\/\.\*\+\|]")
+import re
+
+# allow ALL unicode letters/digits (via \w), spaces, and common FTS operators/symbols
+# keeps diacritics like ñ, ā, ī, ṇ, etc. because \w is unicode-aware
+_FTS_SAFE = re.compile(r"[^\w\s:\"'\-\(\)\/\.\*\+\|]", flags=re.UNICODE)
 
 def _fts_sanitize(q: str) -> str:
     q = (q or "").strip()
     if not q:
         return ""
+    # Uppercase boolean operators so FTS recognizes them
     q = re.sub(r"\b(or|and|not|near)\b", lambda m: m.group(1).upper(), q, flags=re.IGNORECASE)
+    # Remove only disallowed characters (preserves diacritics)
     q = _FTS_SAFE.sub(" ", q)
+    # Collapse whitespace
     q = re.sub(r"\s+", " ", q).strip()
     return q
+
 
 def ensure_fts(conn: sqlite3.Connection) -> None:
     cols = [r[1] for r in conn.execute("PRAGMA table_info(verses)").fetchall()]
@@ -70,7 +78,7 @@ def ensure_fts(conn: sqlite3.Connection) -> None:
 
     conn.execute("DROP TABLE IF EXISTS verses_fts")
     col_defs = ",\n  ".join(fts_cols)
-    conn.execute(f"CREATE VIRTUAL TABLE verses_fts USING fts5(\n  {col_defs},\n  content='',\n  tokenize='unicode61'\n)")
+    conn.execute(f"CREATE VIRTUAL TABLE verses_fts USING fts5(\n  {col_defs},\n  content='',\n  tokenize='unicode61 remove_diacritics 2'\n)")
 
     col_csv = ",".join(fts_cols)
     conn.execute(f"INSERT INTO verses_fts(rowid,{col_csv}) SELECT rowid,{col_csv} FROM verses")
