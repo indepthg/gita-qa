@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -30,25 +29,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS verses_fts USING fts5(
   translation,
   word_meanings,
   roman,
+  colloquial,
   content='verses',
   content_rowid='id',
-  tokenize='unicode61 remove_diacritics 2'
+  tokenize='unicode61'
 );
 
 CREATE TRIGGER IF NOT EXISTS verses_ai AFTER INSERT ON verses BEGIN
-  INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman)
-  VALUES(new.id,new.title,new.translation,new.word_meanings,new.roman);
+  INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
+  VALUES(new.id,new.title,new.translation,new.word_meanings,new.roman,new.colloquial);
 END;
 
 CREATE TRIGGER IF NOT EXISTS verses_ad AFTER DELETE ON verses BEGIN
-  DELETE FROM verses_fts WHERE rowid=old.id;
+  INSERT INTO verses_fts(verses_fts,rowid) VALUES('delete', old.id);
 END;
 
 CREATE TRIGGER IF NOT EXISTS verses_au AFTER UPDATE ON verses BEGIN
-  INSERT INTO verses_fts(verses_fts,rowid,title,translation,word_meanings,roman)
-    VALUES('delete',old.id,old.title,old.translation,old.word_meanings,old.roman);
-  INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman)
-    VALUES(new.id,new.title,new.translation,new.word_meanings,new.roman);
+  INSERT INTO verses_fts(verses_fts,rowid) VALUES('delete', old.id);
+  INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial)
+    VALUES(new.id,new.title,new.translation,new.word_meanings,new.roman,new.colloquial);
 END;
 """
 
@@ -78,15 +77,14 @@ def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
         "INSERT INTO verses (rownum,audio_id,chapter,verse,sanskrit,roman,colloquial,translation,capsule_url,word_meanings,title) "
         "VALUES (:rownum,:audio_id,:chapter,:verse,:sanskrit,:roman,:colloquial,:translation,:capsule_url,:word_meanings,:title) "
         "ON CONFLICT(chapter,verse) DO UPDATE SET "
-        "rownum=excluded.rownum,audio_id=excluded.audio_id,sanskrit=excluded.sanskrit,roman=excluded.roman," \
-        "colloquial=excluded.colloquial,translation=excluded.translation,capsule_url=excluded.capsule_url," \
+        "rownum=excluded.rownum,audio_id=excluded.audio_id,sanskrit=excluded.sanskrit,roman=excluded.roman,"
+        "colloquial=excluded.colloquial,translation=excluded.translation,capsule_url=excluded.capsule_url,"
         "word_meanings=excluded.word_meanings,title=excluded.title;"
     )
     conn.execute(sql, row)
 
 
 def bulk_upsert(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> int:
-    cur = conn.cursor()
     count = 0
     for r in rows:
         upsert_verse(conn, r)
@@ -104,7 +102,6 @@ def fetch_exact(conn: sqlite3.Connection, chap: int, ver: int) -> Optional[sqlit
 
 
 def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -> List[sqlite3.Row]:
-    # same chapter neighbors ver-k .. ver+k excluding ver
     cur = conn.execute(
         "SELECT * FROM verses WHERE chapter=? AND verse BETWEEN ? AND ? ORDER BY verse ASC",
         (chap, max(1, ver - k), ver + k),
@@ -114,7 +111,6 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
 
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
-    # simple FTS search across indexed columns
     cur = conn.execute(
         "SELECT v.* FROM verses_fts f JOIN verses v ON v.id=f.rowid WHERE verses_fts MATCH ? LIMIT ?",
         (q, limit),
