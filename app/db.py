@@ -99,7 +99,7 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
     cur = conn.execute(
-        "SELECT v.* FROM verses_fts f JOIN verses v ON v.rowid=f.rowid WHERE verses_fts MATCH ? LIMIT ?",
+        "SELECT v.* FROM verses_fts f JOIN verses v ON v.rowid=f.rowid WHERE f MATCH ? LIMIT ?",
         (q, limit),
     )
     return cur.fetchall()
