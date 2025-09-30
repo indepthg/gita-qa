@@ -54,33 +54,38 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         if close_after:
             conn.close()
 
-def ensure_fts(conn: sqlite3.Connection) -> None:
+import re
+
+# allow letters/digits/space and common FTS operators/symbols
+_FTS_SAFE = re.compile(r"[^A-Za-z0-9\s:\"'\-\(\)\/\.\*\+\|]")
+
+def _fts_sanitize(q: str) -> str:
+    q = (q or "").strip()
+    if not q:
+        return ""
+    # Uppercase boolean operators (optional)
+    q = re.sub(r"\b(or|and|not|near)\b", lambda m: m.group(1).upper(), q, flags=re.IGNORECASE)
+    # Remove unsafe chars
+    q = _FTS_SAFE.sub(" ", q)
+    # Collapse whitespace
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
+    q2 = _fts_sanitize(q)
+    if not q2:
+        return []
+    # IMPORTANT: inline sanitized query because this SQLite build rejects MATCH parameters
+    sql = f"""
+        SELECT v.*
+        FROM verses_fts
+        JOIN verses AS v ON v.rowid = verses_fts.rowid
+        WHERE verses_fts MATCH {sqlite3.escape_string(q2).decode() if hasattr(sqlite3, 'escape_string') else "'" + q2.replace("'", "''") + "'"}
+        LIMIT ?
     """
-    Drop and rebuild a contentless FTS5 index from current rows in `verses`.
-    We include commentary1/2/3 to improve broad queries without embeddings.
-    """
-    conn.executescript("""
-    DROP TABLE IF EXISTS verses_fts;
-    CREATE VIRTUAL TABLE verses_fts USING fts5(
-      title,
-      translation,
-      word_meanings,
-      roman,
-      colloquial,
-      commentary1,
-      commentary2,
-      commentary3,
-      content='',
-      tokenize='unicode61'
-    );
-    """)
-    # Populate from verses using rowid (schema-agnostic, works even if id differs)
-    conn.execute("""
-    INSERT INTO verses_fts(rowid,title,translation,word_meanings,roman,colloquial,commentary1,commentary2,commentary3)
-    SELECT rowid, title, translation, word_meanings, roman, colloquial, commentary1, commentary2, commentary3
-    FROM verses
-    """)
-    conn.commit()
+    cur = conn.execute(sql, (limit,))
+    return cur.fetchall()
+
 
 def upsert_verse(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     sql = (
