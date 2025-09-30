@@ -98,11 +98,21 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
     return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
+    q = (q or "").strip()
+    if not q:
+        return []
     cur = conn.execute(
-        "SELECT v.* FROM verses_fts f JOIN verses v ON v.rowid=f.rowid WHERE f MATCH ? LIMIT ?",
+        """
+        SELECT v.*
+        FROM verses_fts
+        JOIN verses AS v ON v.rowid = verses_fts.rowid
+        WHERE verses_fts MATCH ?
+        LIMIT ?
+        """,
         (q, limit),
     )
     return cur.fetchall()
+
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
     v = conn.execute("SELECT COUNT(1) AS c FROM verses").fetchone()["c"]
