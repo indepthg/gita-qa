@@ -8,7 +8,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import get_conn, init_db, bulk_upsert, fetch_exact, fetch_neighbors, search_fts, stats
+from .db import get_conn, init_db, bulk_upsert, fetch_exact, fetch_neighbors, search_fts, stats, ensure_fts
+
 from .ingest import load_sheet_to_rows, ingest_commentary
 from . import embed_store
 
@@ -137,6 +138,9 @@ def home():
     """
 
 
+# add ensure_fts to your imports at the top of main.py:
+# from .db import get_conn, init_db, bulk_upsert, fetch_exact, fetch_neighbors, search_fts, stats, ensure_fts
+
 @app.post("/ingest_sheet_sql")
 async def ingest_sheet_sql(file: UploadFile = File(...)):
     try:
@@ -144,9 +148,11 @@ async def ingest_sheet_sql(file: UploadFile = File(...)):
         rows = load_sheet_to_rows(bytes_, file.filename)
         conn = get_conn()
         n = bulk_upsert(conn, rows)
+        ensure_fts(conn)  # <— rebuild the contentless FTS index so broad queries work
         return {"ingested_rows": n}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 
 @app.post("/ingest_commentary")
