@@ -122,8 +122,28 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
     q2 = _fts_sanitize(q)
     if not q2:
         return []
+
+    # If the user didn't specify operators, convert the sentence to a keyword OR query.
+    has_ops = bool(re.search(r'(?:"|\\bOR\\b|\\bAND\\b|\\bNOT\\b|\\bNEAR/\\d+\\b|\\bNEAR\\b)', q2))
+    if not has_ops:
+        # very small English stoplist to drop unhelpful terms
+        STOP = {
+            "the","a","an","and","or","of","to","in","on","for","with","by","about",
+            "what","which","who","whom","is","are","was","were","be","been","being",
+            "that","this","these","those","do","does","did","from","as","at","it",
+            "into","over","under","between","among","how","why","when","where","vs","versus","talk","talks"
+        }
+        toks = re.findall(r'\\w+', q2, flags=re.UNICODE)
+        keywords = [t for t in toks if len(t) >= 4 and t.lower() not in STOP]
+        # If nothing survives, fall back to the original
+        if keywords:
+            q2 = " OR ".join(dict.fromkeys(keywords))
+
+    # Safely inline as SQL literal (escape single quotes)
     q_lit = "'" + q2.replace("'", "''") + "'"
-    sql = f"""        SELECT v.*
+
+    sql = f"""
+        SELECT v.*
         FROM verses_fts
         JOIN verses AS v ON v.rowid = verses_fts.rowid
         WHERE verses_fts MATCH {q_lit}
@@ -131,6 +151,7 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
     """
     cur = conn.execute(sql, (limit,))
     return cur.fetchall()
+
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
     v = conn.execute("SELECT COUNT(1) AS c FROM verses").fetchone()["c"]
