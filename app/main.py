@@ -229,15 +229,21 @@ async def ask(payload: AskPayload):
                 "citations": [f"[{ch}:{v}]"]
             }
 
-    # Broad query: combine FTS + embeddings
+    # Broad query: combine FTS + embeddings (embeddings are optional; never fail the request)
     fts_rows = search_fts(conn, q, limit=6)
-    emb = embed_store.query(q, top_k=6, where={"topic": topic})
-    merged = _merge_hits(fts_rows, emb)
+
+    emb = None
+    try:
+        emb = embed_store.query(q, top_k=6, where={"topic": topic})
+    except Exception:
+        emb = None  # proceed with FTS-only
+
+    merged = _merge_hits(fts_rows, emb or {})
 
     if not merged:
-        return {"answer": NO_MATCH_MESSAGE, "citations": []}
+        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": []}
 
-    # Build a plain text context with short snippets
+    # Build context from FTS rows only (embeddings have no text snippets)
     ctx_lines: List[str] = []
     cites: List[str] = []
     for ch, v, data in merged:
@@ -249,15 +255,17 @@ async def ask(payload: AskPayload):
         if s:
             ctx_lines.append(f"{ch}:{v} {s}")
 
-    ctx = "\n".join(ctx_lines)
+    ctx = "\n".join(ctx_lines) if ctx_lines else ""
     prompt = (
         "Answer the question using only the provided context. Keep it concise, plain text, no markup. "
         "Weave in verse citations like [C:V] when relevant.\n\nQuestion: " + q + "\n\nContext:\n" + ctx
     )
-    ans = _summarize(prompt)
+    ans = _summarize(prompt) if ctx else ""
 
     return {
         "mode": "broad",
         "answer": ans if ans else NO_MATCH_MESSAGE,
         "citations": list(dict.fromkeys(cites))[:8]
     }
+
+
