@@ -106,13 +106,12 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
         SELECT v.*
         FROM verses_fts
         JOIN verses AS v ON v.rowid = verses_fts.rowid
-        WHERE verses_fts MATCH ?
+        WHERE verses_fts MATCH ('"' || ? || '"')
         LIMIT ?
         """,
         (q, limit),
     )
     return cur.fetchall()
-
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
     v = conn.execute("SELECT COUNT(1) AS c FROM verses").fetchone()["c"]
