@@ -131,6 +131,7 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
             "the","a","an","and","or","of","to","in","on","for","with","by","about",
             "what","which","who","whom","is","are","was","were","be","been","being",
             "that","this","these","those","do","does","did","from","as","at","it",
+            "verse", "verses", "mention", "mentions", "talk", "talks", "about", "on",
             "into","over","under","between","among","how","why","when","where","vs","versus","talk","talks"
         }
         toks = re.findall(r'\\w+', q2, flags=re.UNICODE)
