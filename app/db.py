@@ -118,40 +118,32 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
     )
     return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
+STOP = {
+    "the","a","an","and","or","of","to","in","on","for","with","by","about",
+    "what","which","who","whom","is","are","was","were","be","been","being",
+    "that","this","these","those","do","does","did","from","as","at","it",
+    "verse","verses","mention","mentions","talk","talks",
+    "into","over","under","between","among","how","why","when","where",
+    "vs","versus"
+}
+
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
-    q2 = _fts_sanitize(q)
-    if not q2:
-        return []
-
-    # If the user didn't specify operators, convert the sentence to a keyword OR query.
-    has_ops = bool(re.search(r'(?:"|\\bOR\\b|\\bAND\\b|\\bNOT\\b|\\bNEAR/\\d+\\b|\\bNEAR\\b)', q2))
-    if not has_ops:
-        # very small English stoplist to drop unhelpful terms
-        STOP = {
-            "the","a","an","and","or","of","to","in","on","for","with","by","about",
-            "what","which","who","whom","is","are","was","were","be","been","being",
-            "that","this","these","those","do","does","did","from","as","at","it",
-            "verse", "verses", "mention", "mentions", "talk", "talks", "about", "on",
-            "into","over","under","between","among","how","why","when","where","vs","versus","talk","talks"
-        }
-        toks = re.findall(r'\\w+', q2, flags=re.UNICODE)
-        keywords = [t for t in toks if len(t) >= 4 and t.lower() not in STOP]
-        # If nothing survives, fall back to the original
-        if keywords:
-            q2 = " OR ".join(dict.fromkeys(keywords))
-
-    # Safely inline as SQL literal (escape single quotes)
-    q_lit = "'" + q2.replace("'", "''") + "'"
-
-    sql = f"""
-        SELECT v.*
-        FROM verses_fts
-        JOIN verses AS v ON v.rowid = verses_fts.rowid
-        WHERE verses_fts MATCH {q_lit}
-        LIMIT ?
     """
-    cur = conn.execute(sql, (limit,))
+    Run a sanitized full-text search against verses_fts.
+    Removes common stop words, but preserves important Sanskrit/English tokens.
+    """
+    tokens = [tok for tok in re.split(r"\W+", q.lower()) if tok and tok not in STOP]
+    q2 = " ".join(tokens) if tokens else q.lower().strip()
+
+    # Debug output to Railway logs
+    print(f"[DEBUG search_fts] user={q!r} → fts_query={q2!r}, limit={limit}", flush=True)
+
+    cur = conn.execute(
+        "SELECT v.* FROM verses_fts f JOIN verses v ON v.rowid=f.rowid WHERE verses_fts MATCH ? LIMIT ?",
+        (q2, limit),
+    )
     return cur.fetchall()
+
 
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
