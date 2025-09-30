@@ -119,8 +119,9 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
     """
-    FTS query compatible with runtimes that are strict about MATCH placeholders.
-    We wrap the term in quotes via SQL concatenation to avoid parser errors.
+    Allow FTS operators while keeping a parameterized query.
+    Trick: concatenate with an empty string so MATCH sees a literal string,
+    but we don't force quotes (so OR/NEAR/NOT still work).
     """
     q = (q or "").strip()
     if not q:
@@ -130,7 +131,7 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
         SELECT v.*
         FROM verses_fts
         JOIN verses AS v ON v.rowid = verses_fts.rowid
-        WHERE verses_fts MATCH ('"' || ? || '"')
+        WHERE verses_fts MATCH ('' || ?)
         LIMIT ?
         """,
         (q, limit),
