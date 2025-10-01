@@ -118,33 +118,74 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
     )
     return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
+# Tiny structural stoplist — do NOT include "or/and/not" here
 STOP = {
-    "the","a","an","and","or","of","to","in","on","for","with","by","about",
-    "what","which","who","whom","is","are","was","were","be","been","being",
-    "that","this","these","those","do","does","did","from","as","at","it",
-    "verse","verses","mention","mentions","talk","talks",
-    "into","over","under","between","among","how","why","when","where",
-    "vs","versus"
+    "which", "what", "that", "this", "those", "these",
+    "verse", "verses", "mention", "mentions",
+    "talk", "talks", "about", "on"
 }
 
 def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite3.Row]:
     """
-    Run a sanitized full-text search against verses_fts.
-    Removes common stop words, but preserves important Sanskrit/English tokens.
+    Build a friendly FTS query:
+      - map 'vs', 'vs.', 'versus' -> OR
+      - preserve/uppercase boolean ops (OR/AND/NOT/NEAR)
+      - remove only tiny structural stopwords
+      - if no operators present and multiple tokens, join tokens with OR
+    Then run a sanitized MATCH against verses_fts.
     """
-    tokens = [tok for tok in re.split(r"\W+", q.lower()) if tok and tok not in STOP]
-    q2 = " ".join(tokens) if tokens else q.lower().strip()
+    raw = (q or "").strip()
+    if not raw:
+        return []
 
-    # Debug output to Railway logs
-    print(f"[DEBUG search_fts] user={q!r} → fts_query={q2!r}, limit={limit}", flush=True)
+    # Tokenize on whitespace; keep simple on purpose (quotes/operators still supported)
+    toks = [t for t in re.split(r"\s+", raw) if t]
 
-    cur = conn.execute(
-        "SELECT v.* FROM verses_fts f JOIN verses v ON v.rowid=f.rowid WHERE verses_fts MATCH ? LIMIT ?",
-        (q2, limit),
-    )
+    out = []
+    for t in toks:
+        tl = t.lower()
+        if tl in ("vs", "vs.", "versus"):
+            out.append("OR")
+            continue
+        if tl == "or":
+            out.append("OR")
+            continue
+        if tl in ("and", "not") or tl.startswith("near/") or tl == "near":
+            out.append(t.upper())
+            continue
+        if tl in STOP:
+            continue
+        out.append(t)
+
+    # If user didn't specify any operators, default to OR between remaining terms
+    q_base = " ".join(out).strip()
+    has_ops = bool(re.search(r'(?:"|\bOR\b|\bAND\b|\bNOT\b|\bNEAR(?:/\d+)?\b)', q_base))
+    if not has_ops:
+        # collapse to distinct terms and OR them
+        terms = [t for t in out if t]  # keep original case for readability
+        # if nothing left after stopwords, fall back to raw
+        if terms:
+            q2 = " OR ".join(dict.fromkeys(terms))
+        else:
+            q2 = raw
+    else:
+        q2 = q_base
+
+    # DEBUG to Railway logs
+    print(f"[DEBUG search_fts] user={raw!r} → fts_query={q2!r}, limit={limit}", flush=True)
+
+    # Inline as a SQL literal (escape single quotes)
+    q_lit = "'" + q2.replace("'", "''") + "'"
+
+    sql = f"""
+        SELECT v.*
+        FROM verses_fts
+        JOIN verses AS v ON v.rowid = verses_fts.rowid
+        WHERE verses_fts MATCH {q_lit}
+        LIMIT ?
+    """
+    cur = conn.execute(sql, (limit,))
     return cur.fetchall()
-
-
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
     v = conn.execute("SELECT COUNT(1) AS c FROM verses").fetchone()["c"]
