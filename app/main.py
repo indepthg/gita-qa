@@ -129,7 +129,7 @@ def home():
       </div>
     </div>
   </div>
-  <script src="/static/widget.js?v=wm-fix-1"></script>
+  <script src="/static/widget.js?v=wm-fix-2"></script>
   <script>
     GitaWidget.mount({ root: '#gita', apiBase: '' });
   </script>
