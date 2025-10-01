@@ -1,20 +1,27 @@
-
-// Minimal widget: keeps it plain, no CSS injection beyond a couple inline styles if needed.
-// Usage: include this script, then call GitaWidget.mount({ root: '#gita', apiBase: 'https://YOUR-APP.onrailway.app' })
+// Gita Q&A v2 – minimal, framework‑free widget
+// Plain‑text rendering, dark‑mode friendly pills, ChatGPT‑style chat (latest at bottom),
+// orange round send button with thick arrow, Clear to the left, clickable [C:V] citations,
+// optional Debug toggle (raw JSON + fts_query), /suggest pills, /title/{ch}/{v} fetch.
+// Usage: include this file, then: GitaWidget.mount({ root: '#gita', apiBase: 'https://gita-qa-production.up.railway.app' })
 
 const GitaWidget = (() => {
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
-    Object.entries(attrs).forEach(([k, v]) => {
+    for (const [k, v] of Object.entries(attrs || {})) {
       if (k === 'style' && typeof v === 'object') Object.assign(e.style, v);
-      else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.substring(2), v);
+      else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+      else if (k === 'class') e.className = v;
       else e.setAttribute(k, v);
-    });
-    children.flat().forEach(c => {
-      if (typeof c === 'string') e.appendChild(document.createTextNode(c));
-      else if (c) e.appendChild(c);
-    });
+    }
+    for (const c of children.flat()) {
+      if (c == null) continue;
+      e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
     return e;
+  }
+
+  function prefersDark() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
   }
 
   async function fetchJSON(url, opts) {
@@ -23,92 +30,216 @@ const GitaWidget = (() => {
     return r.json();
   }
 
-  function renderPills(container, apiBase, onPick) {
-    fetchJSON(`${apiBase}/suggest`).then(data => {
-      const box = el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' } });
-      (data.suggestions || []).forEach(s => {
-        const b = el('button', { style: { padding: '6px 10px', borderRadius: '999px', border: '1px solid #ddd', background: '#f7f7f7', cursor: 'pointer' } }, s);
-        b.addEventListener('click', () => onPick(s));
-        box.appendChild(b);
+  // --- Text cleaning (plain‑text only) ---
+  // Rules: <br> -> newline; strip all other tags; collapse extra blank lines; trim.
+  function toPlain(text) {
+    if (text == null) return '';
+    let t = String(text)
+      .replace(/<\s*br\s*\/?\s*>/gi, '\n') // <br> → \n
+      .replace(/<[^>]+>/g, '')                 // strip remaining tags
+      .replace(/\r\n?|\u2028|\u2029/g, '\n'); // normalize breaks
+    // Decode a few common HTML entities without pulling a library
+    t = t.replace(/&nbsp;/g, ' ')
+         .replace(/&amp;/g, '&')
+         .replace(/&lt;/g, '<')
+         .replace(/&gt;/g, '>')
+         .replace(/&quot;/g, '"')
+         .replace(/&#39;/g, "'");
+    // Collapse multi-blank lines and trim trailing spaces around newlines
+    t = t.replace(/[ \t]+\n/g, '\n')
+         .replace(/\n{3,}/g, '\n\n')
+         .trim();
+    return t;
+  }
+
+  // Renders citations like [2:47] → clickable that fetches /title/{ch}/{v}
+  function renderCitations(apiBase, citations) {
+    if (!citations || !citations.length) return null;
+    const wrap = el('div', { class: 'citations', style: { display: 'flex', gap: '6px', flexWrap: 'wrap', fontSize: '12px' } });
+    citations.forEach(tag => {
+      const m = /^(\d{1,2})[:.-](\d{1,3})$/.exec(String(tag).trim());
+      const label = `[${String(tag)}]`;
+      const btn = el('button', {
+        class: 'citation-pill',
+        title: 'Show title',
+        style: {
+          borderRadius: '999px', padding: '2px 8px', border: '1px solid var(--c-border)', cursor: 'pointer',
+          background: 'var(--c-pill-bg)', color: 'var(--c-pill-fg)'
+        }
+      }, label);
+      btn.addEventListener('click', async () => {
+        if (!m) return;
+        const [_, ch, v] = m;
+        try {
+          const j = await fetchJSON(`${apiBase}/title/${ch}/${v}`);
+          alert((j && (j.title || j.result || j.answer || j)) ? toPlain(j.title || j.result || j.answer || String(j)) : 'No title');
+        } catch (e) {
+          alert('Could not fetch title: ' + (e.message || e));
+        }
       });
-      container.appendChild(box);
-    }).catch(() => {});
+      wrap.appendChild(btn);
+    });
+    return wrap;
   }
 
   function mount({ root, apiBase }) {
-    const host = (typeof root === 'string') ? document.querySelector(root) : root;
-    if (!host) throw new Error('Root not found');
+    const host = typeof root === 'string' ? document.querySelector(root) : root;
+    if (!host) throw new Error('Root element not found');
 
-    const out = el('div', { style: { border: '1px solid #eee', padding: '12px', borderRadius: '8px' } });
-    const log = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px', minHeight: '120px' } });
-    const form = el('div', { style: { display: 'flex', gap: '8px', marginTop: '8px' } });
-    const input = el('input', { type: 'text', placeholder: 'Ask about the Gita…', style: { flex: 1, padding: '10px 12px', borderRadius: '6px', border: '1px solid #ddd' } });
-    const send = el('button', { style: { padding: '10px 14px', borderRadius: '6px', border: '1px solid #e07a00', background: '#ff8d1a', color: '#fff', cursor: 'pointer' } }, 'Ask');
-    const clear = el('button', { style: { padding: '10px 14px', borderRadius: '6px', border: '1px solid #ddd', background: '#fafafa', cursor: 'pointer' } }, 'Clear');
+    // Theme tokens (good contrast in light/dark)
+    const dark = prefersDark();
+    const vars = {
+      '--c-bg': dark ? '#0f1115' : '#ffffff',
+      '--c-panel': dark ? '#141820' : '#f9fafb',
+      '--c-border': dark ? '#2a2f3a' : '#e5e7eb',
+      '--c-fg': dark ? '#e5e7eb' : '#111827',
+      '--c-muted': dark ? '#a3aab8' : '#6b7280',
+      '--c-pill-bg': dark ? '#1f2530' : '#f3f4f6',
+      '--c-pill-fg': dark ? '#e5e7eb' : '#1f2937',
+      '--c-accent': '#ff8d1a', // orange
+      '--c-accent-border': '#e07a00'
+    };
 
-    function pushMessage(role, payload, citations) {
-      const line = el('div');
+    const style = el('style', {}, `
+      .gw2 * { box-sizing: border-box; }
+      .gw2 { background: var(--c-bg); color: var(--c-fg); border: 1px solid var(--c-border); border-radius: 10px; padding: 12px; }
+      .gw2 .log { display: flex; flex-direction: column; gap: 12px; max-height: min(60vh, 520px); overflow: auto; padding: 8px; background: var(--c-panel); border: 1px solid var(--c-border); border-radius: 8px; }
+      .gw2 .msg { display: flex; gap: 10px; align-items: flex-start; white-space: pre-wrap; }
+      .gw2 .msg .role { font-weight: 600; color: var(--c-muted); min-width: 42px; text-align: right; }
+      .gw2 .msg .bubble { flex: 1; }
+      .gw2 .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+      .gw2 input[type="text"] { flex: 1; padding: 12px; border: 1px solid var(--c-border); border-radius: 8px; background: transparent; color: var(--c-fg); }
+      .gw2 .clear { padding: 10px 12px; border: 1px solid var(--c-border); background: transparent; border-radius: 8px; cursor: pointer; color: var(--c-fg); }
+      .gw2 .send { width: 46px; height: 46px; border-radius: 999px; border: 2px solid var(--c-accent-border); background: var(--c-accent); color: #fff; cursor: pointer; display: grid; place-items: center; font-size: 20px; line-height: 1; }
+      .gw2 .send:active { transform: translateY(1px); }
+      .gw2 .pillbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+      .gw2 .pill { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--c-border); background: var(--c-pill-bg); color: var(--c-pill-fg); cursor: pointer; }
+      .gw2 details.debug { margin-top: 6px; font-size: 12px; color: var(--c-muted); }
+      .gw2 .citations { margin-top: 6px; }
+    `);
+
+    const wrap = el('div', { class: 'gw2' });
+    Object.entries(vars).forEach(([k, v]) => wrap.style.setProperty(k, v));
+    wrap.appendChild(style);
+
+    const log = el('div', { class: 'log', role: 'log', 'aria-live': 'polite' });
+
+    const input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., 2.47 meaning)', autocomplete: 'off' });
+
+    const clearBtn = el('button', { class: 'clear', title: 'Clear conversation' }, 'Clear');
+
+    const sendBtn = el('button', { class: 'send', title: 'Send' }, '➤'); // thick arrow vibe
+
+    const row = el('div', { class: 'row' }, clearBtn, input, sendBtn);
+
+    const pillbar = el('div', { class: 'pillbar' });
+
+    const debugToggle = el('label', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px', fontSize: '12px', color: 'var(--c-muted)' } },
+      el('input', { type: 'checkbox', id: 'gw2-debug' }), 'Debug');
+
+    wrap.appendChild(log);
+    wrap.appendChild(row);
+    wrap.appendChild(pillbar);
+    wrap.appendChild(debugToggle);
+
+    host.appendChild(wrap);
+
+    function autoScroll() { log.scrollTop = log.scrollHeight; }
+
+    function pushMessage(role, content, extras = {}) {
+      const msg = el('div', { class: 'msg' });
+      const roleEl = el('div', { class: 'role' }, role === 'user' ? 'You' : 'Bot');
+      const bubble = el('div', { class: 'bubble' });
+
       if (role === 'user') {
-        line.appendChild(el('div', {}, 'You: ' + payload));
+        bubble.textContent = content;
       } else {
-        // If it's our rich explain payload, render fields
-        if (payload && typeof payload === 'object' && payload.mode === 'explain') {
-          const order = ['title','sanskrit','roman','colloquial','translation','word_meanings','summary'];
-          order.forEach(k => {
-            if (payload[k]) line.appendChild(el('div', {}, payload[k]));
-          });
+        // Bot: handle object or plain string
+        if (content && typeof content === 'object') {
+          // Best‑effort fields; everything rendered as plain text
+          const fieldsOrder = ['title','sanskrit','roman','colloquial','translation','word_meanings','summary','answer'];
+          let any = false;
+          for (const k of fieldsOrder) {
+            if (content[k]) { any = true; bubble.appendChild(el('div', {}, toPlain(content[k]))); }
+          }
+          if (!any) bubble.textContent = toPlain(JSON.stringify(content));
         } else {
-          const txt = (payload && payload.answer) ? payload.answer : (typeof payload === 'string' ? payload : '');
-          line.appendChild(el('div', {}, 'Answer: ' + (txt || '')));
-        }
-        if (citations && citations.length) {
-          line.appendChild(el('div', { style: { fontSize: '12px', color: '#666' } }, citations.join(' ')));
+          bubble.textContent = toPlain(content);
         }
       }
-      log.appendChild(line);
-      log.scrollTop = log.scrollHeight;
+
+      msg.appendChild(roleEl);
+      msg.appendChild(bubble);
+
+      // Citations
+      if (extras.citations && extras.citations.length) {
+        const c = renderCitations(apiBase, extras.citations);
+        if (c) msg.appendChild(c);
+      }
+
+      // Debug (raw JSON & fts_query)
+      if ((document.getElementById('gw2-debug') || {}).checked && extras.raw) {
+        const d = el('details', { class: 'debug' },
+          el('summary', {}, 'Debug payload'));
+        const pre = el('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(extras.raw, null, 2));
+        d.appendChild(pre);
+        if (extras.raw.fts_query) d.appendChild(el('div', {}, 'fts_query: ' + extras.raw.fts_query));
+        msg.appendChild(d);
+      }
+
+      log.appendChild(msg);
+      autoScroll();
     }
 
-    async function ask(q) {
+    async function loadPills() {
+      try {
+        const s = await fetchJSON(`${apiBase}/suggest`);
+        (s.suggestions || []).forEach(text => {
+          const b = el('button', { class: 'pill' }, text);
+          b.addEventListener('click', () => doAsk(text));
+          pillbar.appendChild(b);
+        });
+      } catch (e) { /* ignore */ }
+    }
+
+    async function doAsk(q) {
       pushMessage('user', q);
       try {
-        const data = await fetchJSON(`${apiBase}/ask`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: q, topic: 'gita' })
+        const payload = { question: q, topic: 'gita' };
+        const res = await fetchJSON(`${apiBase}/ask`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
         });
-        pushMessage('bot', data, data.citations);
+
+        // Citations array? Accept ["2:47", "18:66"] or nested res.citations
+        const citations = Array.isArray(res.citations) ? res.citations : [];
+        // Show raw in debug if toggled
+        pushMessage('bot', res.answer ?? res, { citations, raw: res });
       } catch (e) {
         pushMessage('bot', 'Error: ' + (e.message || e));
       }
     }
 
-    send.addEventListener('click', () => {
-      const q = input.value.trim();
+    // Wire up controls
+    sendBtn.addEventListener('click', () => {
+      const q = (input.value || '').trim();
       if (!q) return;
       input.value = '';
-      ask(q);
+      doAsk(q);
+      input.focus();
     });
     input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') send.click();
+      if (ev.key === 'Enter') sendBtn.click();
     });
-    clear.addEventListener('click', () => { log.innerHTML = ''; });
+    clearBtn.addEventListener('click', () => { log.innerHTML = ''; input.focus(); });
 
-    form.appendChild(input);
-    form.appendChild(send);
-    form.appendChild(clear);
+    // Initial state
+    loadPills();
 
-    out.appendChild(log);
-    out.appendChild(form);
-    host.appendChild(out);
-
-    renderPills(out, apiBase, (s) => ask(s));
-
-    return { ask };
+    return { ask: doAsk };
   }
 
   return { mount };
 })();
 
-// UMD-lite
+// UMD‑lite
 if (typeof window !== 'undefined') window.GitaWidget = GitaWidget;
