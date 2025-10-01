@@ -118,7 +118,7 @@ def fetch_neighbors(conn: sqlite3.Connection, chap: int, ver: int, k: int = 1) -
     )
     return [r for r in cur.fetchall() if int(r["verse"]) != ver]
 
-# Tiny structural stoplist — do NOT include "or/and/not" here
+# Tiny structural stoplist — do NOT include boolean ops here
 STOP = {
     "which", "what", "that", "this", "those", "these",
     "verse", "verses", "mention", "mentions",
@@ -129,45 +129,47 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
     """
     Build a friendly FTS query:
       - map 'vs', 'vs.', 'versus' -> OR
-      - preserve/uppercase boolean ops (OR/AND/NOT/NEAR)
-      - remove only tiny structural stopwords
-      - if no operators present and multiple tokens, join tokens with OR
+      - preserve/uppercase boolean ops (OR/AND/NOT/NEAR[/k])
+      - strip leading/trailing punctuation from tokens (so 'prajna?' -> 'prajna')
+      - remove tiny structural stopwords
+      - if no operators present and multiple tokens, join with OR
     Then run a sanitized MATCH against verses_fts.
     """
     raw = (q or "").strip()
     if not raw:
         return []
 
-    # Tokenize on whitespace; keep simple on purpose (quotes/operators still supported)
     toks = [t for t in re.split(r"\s+", raw) if t]
 
     out = []
     for t in toks:
         tl = t.lower()
-        if tl in ("vs", "vs.", "versus"):
-            out.append("OR")
-            continue
-        if tl == "or":
-            out.append("OR")
-            continue
-        if tl in ("and", "not") or tl.startswith("near/") or tl == "near":
-            out.append(t.upper())
-            continue
-        if tl in STOP:
-            continue
-        out.append(t)
 
-    # If user didn't specify any operators, default to OR between remaining terms
+        # strip leading/trailing punctuation but keep unicode letters/digits/underscore
+        core = re.sub(r"^[^\w]+|[^\w]+$", "", tl, flags=re.UNICODE)
+        if not core:
+            continue
+
+        if core in ("vs", "vs.", "versus"):
+            out.append("OR"); continue
+        if core == "or":
+            out.append("OR"); continue
+        if core in ("and", "not") or core.startswith("near/") or core == "near":
+            out.append(core.upper()); continue
+        if core in STOP:
+            continue
+
+        # use the original token minus punctuation for readability (diacritics preserved)
+        out.append(re.sub(r"^[^\w]+|[^\w]+$", "", t, flags=re.UNICODE))
+
     q_base = " ".join(out).strip()
     has_ops = bool(re.search(r'(?:"|\bOR\b|\bAND\b|\bNOT\b|\bNEAR(?:/\d+)?\b)', q_base))
     if not has_ops:
-        # collapse to distinct terms and OR them
-        terms = [t for t in out if t]  # keep original case for readability
-        # if nothing left after stopwords, fall back to raw
+        terms = [t for t in out if t]
         if terms:
             q2 = " OR ".join(dict.fromkeys(terms))
         else:
-            q2 = raw
+            q2 = raw  # fallback
     else:
         q2 = q_base
 
@@ -186,6 +188,9 @@ def search_fts(conn: sqlite3.Connection, q: str, limit: int = 10) -> List[sqlite
     """
     cur = conn.execute(sql, (limit,))
     return cur.fetchall()
+
+
+
 
 def stats(conn: sqlite3.Connection) -> Dict[str, int]:
     v = conn.execute("SELECT COUNT(1) AS c FROM verses").fetchone()["c"]
