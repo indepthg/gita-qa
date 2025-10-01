@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Gita Widget</title>
+</head>
+<body>
+  <div id="gita"></div>
+
+  <!-- Load your widget.js with cache-busting -->
+  <script src="widget.js?v=wm-fix-2"></script>
+
+  <script>
+    GitaWidget.mount({
+      root: '#gita',
+      apiBase: 'https://courteous-illumination-production-0a81.up.railway.app'
+    });
+  </script>
+</body>
+</html>
