@@ -27,9 +27,11 @@ def _coerce_int(x):
 def load_sheet_to_rows(file_bytes: bytes, filename: str) -> List[Dict]:
     name = filename.lower()
     if name.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(file_bytes))
+        # keep_default_na=False prevents 'nan' strings later
+        df = pd.read_csv(io.BytesIO(file_bytes), keep_default_na=False)
     elif name.endswith(".xlsx"):
         df = pd.read_excel(io.BytesIO(file_bytes))
+        df = df.fillna("")  # avoid NaN -> 'nan'
     else:
         raise ValueError("Unsupported sheet format. Use CSV or XLSX.")
 
@@ -37,6 +39,18 @@ def load_sheet_to_rows(file_bytes: bytes, filename: str) -> List[Dict]:
     for rc in REQUIRED_COLS:
         if rc not in cols:
             raise ValueError(f"Missing required column: {rc}")
+
+    # Commentary columns are optional; use if present
+    has_c1 = "commentary1" in cols
+    has_c2 = "commentary2" in cols
+    has_c3 = "commentary3" in cols
+
+    def _get(row, key_lower):
+        if key_lower not in cols:
+            return ""
+        val = row.get(cols[key_lower], "")
+        # handle pandas NA cleanly
+        return "" if pd.isna(val) else str(val)
 
     out: List[Dict] = []
     for _, r in df.iterrows():
@@ -46,18 +60,22 @@ def load_sheet_to_rows(file_bytes: bytes, filename: str) -> List[Dict]:
             continue
         out.append({
             "rownum": _coerce_int(r[cols["rownum"]]),
-            "audio_id": str(r.get(cols["audio_id"], "") or ""),
+            "audio_id": _get(r, "audio_id"),
             "chapter": chap,
             "verse": ver,
-            "sanskrit": str(r.get(cols["sanskrit"], "") or ""),
-            "roman": str(r.get(cols["roman"], "") or ""),
-            "colloquial": str(r.get(cols["colloquial"], "") or ""),
-            "translation": str(r.get(cols["translation"], "") or ""),
-            "capsule_url": str(r.get(cols["capsule_url"], "") or ""),
-            "word_meanings": str(r.get(cols["word_meanings"], "") or ""),
-            "title": str(r.get(cols["title"], "") or ""),
+            "sanskrit": _get(r, "sanskrit"),
+            "roman": _get(r, "roman"),
+            "colloquial": _get(r, "colloquial"),
+            "translation": _get(r, "translation"),
+            "capsule_url": _get(r, "capsule_url"),
+            "word_meanings": _get(r, "word_meanings"),
+            "title": _get(r, "title"),
+            "commentary1": _get(r, "commentary1") if has_c1 else "",
+            "commentary2": _get(r, "commentary2") if has_c2 else "",
+            "commentary3": _get(r, "commentary3") if has_c3 else "",
         })
     return out
+
 
 def _chunk_text(txt: str, size: int = 1000, overlap: int = 120) -> List[str]:
     txt = txt.replace("\r", "\n")
