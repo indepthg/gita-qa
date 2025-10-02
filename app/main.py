@@ -130,12 +130,21 @@ def home():
     </div>
   </div>
 <script>
-(function(){
+(function () {
   var s = document.createElement('script');
-  s.src = '/static/widget.js?v=' + Date.now();  // always new
-  s.onload = function() {
+  s.src = '/static/widget.js?v=' + Date.now();   // auto cache-buster
+  s.async = true;                                // don't block page render
+  s.onload = function () {
     // only run once widget.js is ready
-    GitaWidget.mount({ root: '#gita', apiBase: '' });
+    if (window.GitaWidget && GitaWidget.mount) {
+      GitaWidget.mount({ root: '#gita', apiBase: '' });
+      console.log('[GW] mounted via dynamic loader');
+    } else {
+      console.error('GitaWidget not found after load');
+    }
+  };
+  s.onerror = function (e) {
+    console.error('Failed to load widget.js', e);
   };
   document.head.appendChild(s);
 })();
