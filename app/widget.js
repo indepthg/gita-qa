@@ -1,11 +1,15 @@
-// Gita Q&A v2 — Simplified widget (Word Meaning mode removed)
-// - Keep Explain flow as-is (translation italic, Summary: ...).
-// - Any citations render as clickable pills -> run "Explain C.V" in chat.
-// - Term/phrase lookup is unchanged; if backend returns citations, they appear as pills.
-// - Send button: orange round; thick/short ↑; spinner replaces arrow on send.
-// - Plain-text rendering only (HTML stripped except <br> -> newline).
+// Gita Q&A v2 — No-WM + robust clickable citations
+// Version: v2.3-noWM-cites
+// - REMOVED Word Meaning mode entirely.
+// - Citations always clickable: uses res.citations and also scans text (2:47, [2:47], 2.47).
+// - Clicking a pill runs "Explain C.V" in the chat.
+// - Explain flow unchanged (translation italic, 'Summary:' inline).
+// - Plain text only (strip HTML; <br> -> \n).
+// - Send button: orange round, short/thick ↑, spinner replaces arrow while sending.
 
 const GitaWidget = (() => {
+  console.log('[GW] init v2.3-noWM-cites');
+
   // -------- helpers --------
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
@@ -51,18 +55,30 @@ const GitaWidget = (() => {
     return t;
   }
 
+  // -------- citation extraction --------
+  const citeRe = /(?:\[\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
+  function extractCitationsFromText(text) {
+    const s = toPlain(text || '');
+    const set = new Set();
+    let m;
+    while ((m = citeRe.exec(s))) {
+      const ch = +m[1], v = +m[2];
+      if (ch >= 1 && ch <= 18 && v >= 1 && v <= 200) set.add(`${ch}:${v}`);
+    }
+    return Array.from(set);
+  }
+
   // -------- clickable citations [C:V] --------
   function renderCitations(citations, onExplain) {
     if (!citations || !citations.length) return null;
     const wrap = el('div', { class: 'citations', style: { display: 'flex', gap: '6px', flexWrap: 'wrap', fontSize: '12px' } });
-    citations.forEach(tag0 => {
-      const s = String(tag0).trim().replace(/^\[|\]$/g, '');
-      const m = /^(\d{1,2})[:.-](\d{1,3})$/.exec(s);
+    citations.forEach(cv => {
+      const m = /^(\d{1,2}):(\d{1,3})$/.exec(String(cv).trim());
       if (!m) return;
       const label = `${m[1]}:${m[2]}`;
       const btn = el('button', {
         class: 'citation-pill',
-        title: 'Explain this verse',
+        title: `Explain ${label}`,
         style: {
           borderRadius: '999px',
           padding: '2px 8px',
@@ -86,7 +102,7 @@ const GitaWidget = (() => {
     const dark = prefersDark();
     const vars = {
       '--c-bg': dark ? '#0f1115' : '#ffffff',
-      '--c-panel': dark ? '#141820' : '#f9f9fb',
+      '--c-panel': dark ? '#141820' : '#f9fafb',
       '--c-border': dark ? '#2a2f3a' : '#e5e7eb',
       '--c-fg': dark ? '#e5e7eb' : '#111827',
       '--c-muted': dark ? '#a3aab8' : '#6b7280',
@@ -152,10 +168,13 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
-      // Always show citation pills when provided
-      if (role === 'bot' && extras.citations && extras.citations.length) {
-        const c = renderCitations(extras.citations, (ch, v) => doAsk(`Explain ${ch}.${v}`));
-        if (c) msg.appendChild(c);
+      // Gather citations: explicit + found in text
+      let citeSet = new Set();
+      if (extras.citations && Array.isArray(extras.citations)) {
+        extras.citations.forEach(c => {
+          const m = /^(\d{1,2})[:.](\d{1,3})$/.exec(String(c));
+          if (m) citeSet.add(`${m[1]}:${m[2]}`);
+        });
       }
 
       if (role === 'user') {
@@ -169,12 +188,27 @@ const GitaWidget = (() => {
           if (content.roman)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
           if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
           if (content.summary) { any = true; bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + toPlain(content.summary))); }
+
+          // Scan fields for inline refs
+          ['answer','summary','title','translation'].forEach(k => {
+            if (content[k]) extractCitationsFromText(content[k]).forEach(cv => citeSet.add(cv));
+          });
+
           const rest = content.answer;
           if (!any && rest) bubble.appendChild(el('div', {}, toPlain(rest)));
           if (!any && !rest) bubble.textContent = toPlain(JSON.stringify(content));
         } else {
-          bubble.textContent = toPlain(content);
+          const s = String(content || '');
+          extractCitationsFromText(s).forEach(cv => citeSet.add(cv));
+          bubble.textContent = toPlain(s);
         }
+      }
+
+      // Render citations pills (unique)
+      const cites = Array.from(citeSet);
+      if (cites.length) {
+        const c = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
+        if (c) msg.appendChild(c);
       }
 
       msg.appendChild(bubble);
@@ -240,3 +274,4 @@ const GitaWidget = (() => {
 })();
 
 if (typeof window !== 'undefined') window.GitaWidget = GitaWidget;
+
