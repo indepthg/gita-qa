@@ -129,10 +129,17 @@ def home():
       </div>
     </div>
   </div>
-  <script src="/static/widget.js?v=wm-fix-8"></script>
-  <script>
+<script>
+(function(){
+  var s = document.createElement('script');
+  s.src = '/static/widget.js?v=' + Date.now();  // always new
+  s.onload = function() {
+    // only run once widget.js is ready
     GitaWidget.mount({ root: '#gita', apiBase: '' });
-  </script>
+  };
+  document.head.appendChild(s);
+})();
+</script>
 </body>
 </html>
     """
