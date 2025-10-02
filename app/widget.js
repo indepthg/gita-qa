@@ -1,16 +1,11 @@
 // Gita Q&A v2 — CLEAN FIX (no duplicate vars) 
-// Version: v2.6-clean
-// - Removes "Word meaning ..." pill/heading anywhere.
-// - Explain shows word meanings inline (bold Sanskrit terms), no "Word Meaning" label.
-// - Citations clickable: supports ["[2:16]"], "2.16", "[C:2:16]" and inline refs inside paragraphs.
-// - Plain-text only (<br> -> \n, strip tags).
-// - Orange round send button with short/thick ↑; spinner replaces arrow while sending.
-// - Single, consistent control declarations (no redeclare of input/clearBtn/sendBtn).
+// Version: v2.6.1-clean (closure fix for citation clicks)
+// - Fix: citation button listeners now capture ch/v correctly (no null m).
+// - All other behavior same as v2.6-clean.
 
 const GitaWidget = (() => {
-  console.log('[GW] init v2.6-clean');
+  console.log('[GW] init v2.6.1-clean');
 
-  // ---------- helpers ----------
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -36,7 +31,6 @@ const GitaWidget = (() => {
     return r.json();
   }
 
-  // ---------- plain text ----------
   function toPlain(text) {
     if (text == null) return '';
     let t = String(text)
@@ -55,7 +49,6 @@ const GitaWidget = (() => {
     return t;
   }
 
-  // ---------- word meanings inline (bold keys) ----------
   function renderWordMeaningsInline(text) {
     const container = document.createElement('div');
     container.className = 'wm-inline';
@@ -90,7 +83,6 @@ const GitaWidget = (() => {
     return container;
   }
 
-  // ---------- citations (normalize + extract from text) ----------
   const CITE_TEXT_RE = /(?:\[\s*)?(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
 
   function extractCitationsFromText(text) {
@@ -132,7 +124,8 @@ const GitaWidget = (() => {
     citations.forEach(cv => {
       const m = /^(\d{1,2}):(\d{1,3})$/.exec(String(cv).trim());
       if (!m) return;
-      const label = `${m[1]}:${m[2]}`;
+      const ch = +m[1], v = +m[2];
+      const label = `${ch}:${v}`;
       const btn = el('button', {
         class: 'citation-pill',
         title: `Explain ${label}`,
@@ -145,13 +138,12 @@ const GitaWidget = (() => {
           color: 'var(--c-pill-fg)'
         }
       }, label);
-      btn.addEventListener('click', () => { onExplain && onExplain(m[1], m[2]); });
+      btn.addEventListener('click', () => { onExplain && onExplain(ch, v); });
       wrap.appendChild(btn);
     });
     return wrap;
   }
 
-  // ---------- mount ----------
   function mount({ root, apiBase }) {
     const host = typeof root === 'string' ? document.querySelector(root) : root;
     if (!host) throw new Error('Root element not found');
@@ -220,7 +212,6 @@ const GitaWidget = (() => {
     wrap.appendChild(pillbar);
     wrap.appendChild(debugToggle);
 
-    // attach to host
     host.innerHTML = '';
     host.appendChild(wrap);
 
@@ -230,7 +221,6 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
-      // Normalize & extract citations
       const citeSet = new Set(normalizeCitations(extras.citations));
       if (role === 'bot' && content && typeof content === 'object') {
         ['answer','summary','title','translation','word_meanings'].forEach(k => {
@@ -240,7 +230,6 @@ const GitaWidget = (() => {
         extractCitationsFromText(content).forEach(cv => citeSet.add(cv));
       }
 
-      // Render pills first
       const cites = [...citeSet];
       if (cites.length) {
         const pills = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
@@ -253,7 +242,6 @@ const GitaWidget = (() => {
         if (content && typeof content === 'object') {
           let any = false;
 
-          // Title (suppress any "Word meaning ..." headings from backend)
           let rawTitle = toPlain(content.title || '');
           if (/^\s*word\s*meaning\b/i.test(rawTitle)) rawTitle = '';
           if (rawTitle) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, rawTitle)); }
@@ -262,7 +250,6 @@ const GitaWidget = (() => {
           if (content.roman)       { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
           if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
 
-          // Word meanings inside Explain
           if (content.word_meanings) {
             any = true;
             bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
@@ -278,12 +265,10 @@ const GitaWidget = (() => {
         }
       }
 
-      // Enhance inline refs inside text bubble into clickable micro-pills
       enhanceInlineCitations(bubble, (ch, v) => doAsk(`Explain ${ch}.${v}`));
 
       msg.appendChild(bubble);
 
-      // Debug payload
       if ((document.getElementById('gw2-debug') || {}).checked && extras.raw) {
         const d = el('details', { class: 'debug' }, el('summary', {}, 'Debug payload'));
         d.appendChild(el('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(extras.raw, null, 2)));
@@ -295,9 +280,8 @@ const GitaWidget = (() => {
       autoScroll();
     }
 
-    // Inline citations inside paragraphs -> clickable
     function enhanceInlineCitations(bubble, onExplain) {
-      const RE = CITE_TEXT_RE; // same pattern as above
+      const RE = CITE_TEXT_RE;
       const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, null);
       const targets = [];
       for (let n = walker.nextNode(); n; n = walker.nextNode()) targets.push(n);
@@ -310,14 +294,15 @@ const GitaWidget = (() => {
         while ((m = RE.exec(text))) {
           const before = text.slice(last, m.index);
           if (before) frag.appendChild(document.createTextNode(before));
-          const cv = `${+m[1]}:${+m[2]}`;
+          const ch = +m[1], v = +m[2];
+          const cv = `${ch}:${v}`;
           const btn = el('button', { class: 'citation-pill inline', title: `Explain ${cv}`, style: {
             display:'inline-block', margin:'0 .25em', padding:'0 .5em',
             borderRadius:'999px', border:'1px solid var(--c-border)',
             background:'var(--c-pill-bg)', color:'var(--c-pill-fg)', cursor:'pointer',
             fontSize:'0.9em', lineHeight:'1.6'
           }}, cv);
-          btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onExplain && onExplain(+m[1], +m[2]); }, true);
+          btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onExplain && onExplain(ch, v); }, true);
           frag.appendChild(btn);
           last = RE.lastIndex;
         }
@@ -331,7 +316,6 @@ const GitaWidget = (() => {
       try {
         const s = await fetchJSON(`${apiBase}/suggest`);
         (s.suggestions || []).forEach(text => {
-          // Remove any "Word meaning ..." suggestion pill
           if (/^\s*word\s*meaning\b/i.test(text)) return;
           const b = el('button', { class: 'pill' }, text);
           b.addEventListener('click', () => doAsk(text));
@@ -358,7 +342,6 @@ const GitaWidget = (() => {
       }
     }
 
-    // Wire controls (single declarations)
     sendBtn.addEventListener('click', () => {
       const q = (input.value || '').trim();
       if (!q) return;
@@ -369,7 +352,6 @@ const GitaWidget = (() => {
     input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') sendBtn.click(); });
     clearBtn.addEventListener('click', () => { log.innerHTML = ''; input.focus(); });
 
-    // Init
     loadPills();
     return { ask: doAsk };
   }
