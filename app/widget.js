@@ -1,14 +1,15 @@
-// Gita Q&A v2 — No-WM + robust clickable citations
-// Version: v2.3-noWM-cites
-// - REMOVED Word Meaning mode entirely.
-// - Citations always clickable: uses res.citations and also scans text (2:47, [2:47], 2.47).
-// - Clicking a pill runs "Explain C.V" in the chat.
-// - Explain flow unchanged (translation italic, 'Summary:' inline).
-// - Plain text only (strip HTML; <br> -> \n).
-// - Send button: orange round, short/thick ↑, spinner replaces arrow while sending.
+// Gita Q&A v2 — Explain + Clickable Citations (No "Word Meaning" mode/pill)
+// Version: v2.4-explain-cites
+// - Removes the “Word Meaning …” pill/heading entirely.
+// - Restores Word Meanings inside Explain answers (inline list; Sanskrit terms bold).
+// - Renders citations as clickable pills whether they come from res.citations
+//   (even if like "[2:16]") or appear in the answer text (2:16 / [2:16] / 2.16).
+// - Keeps Explain layout: title, Sanskrit, Roman, Translation (italic), Summary inline.
+// - Plain-text rendering only (strip HTML; <br> -> \n).
+// - Send button: orange round, short/thick ↑; spinner replaces arrow while sending.
 
 const GitaWidget = (() => {
-  console.log('[GW] init v2.3-noWM-cites');
+  console.log('[GW] init v2.4-explain-cites');
 
   // -------- helpers --------
   function el(tag, attrs = {}, ...children) {
@@ -55,20 +56,66 @@ const GitaWidget = (() => {
     return t;
   }
 
-  // -------- citation extraction --------
-  const citeRe = /(?:\[\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
-  function extractCitationsFromText(text) {
-    const s = toPlain(text || '');
-    const set = new Set();
-    let m;
-    while ((m = citeRe.exec(s))) {
-      const ch = +m[1], v = +m[2];
-      if (ch >= 1 && ch <= 18 && v >= 1 && v <= 200) set.add(`${ch}:${v}`);
-    }
-    return Array.from(set);
+  // -------- word-meanings inline (bold keys) --------
+  // Accepts strings like: "karmāṇi = in prescribed duties; eva = certainly; ..."
+  function renderWordMeaningsInline(text) {
+    const container = el('div', { class: 'wm-inline' });
+    const clean = toPlain(text);
+    const normalized = clean.replace(/\s*=\s*/g, ' — '); // canonical em-dash
+    const parts = normalized.split(/;\s*/).map(s => s.trim()).filter(Boolean);
+    if (!parts.length) { container.textContent = normalized; return container; }
+    parts.forEach((seg, i) => {
+      const m = /^(.*?)\s*—\s*(.+)$/.exec(seg);
+      if (m) {
+        const key = m[1].trim();
+        const val = m[2].trim();
+        const bold = el('span', { class: 'wm-key', style: { fontWeight: '800' } }, key);
+        container.appendChild(bold);
+        container.appendChild(el('span', {}, ' — ' + val));
+      } else {
+        container.appendChild(el('span', {}, seg));
+      }
+      if (i < parts.length - 1) container.appendChild(el('span', {}, '; '));
+    });
+    return container;
   }
 
-  // -------- clickable citations [C:V] --------
+  // -------- citations: normalize + extract --------
+  const CITE_TEXT_RE = /(?:\[\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
+
+  function extractCitationsFromText(text) {
+    const s = (text || '').toString();
+    const out = [];
+    let m;
+    while ((m = CITE_TEXT_RE.exec(s))) {
+      const ch = +m[1], v = +m[2];
+      if (ch >= 1 && ch <= 18 && v >= 1 && v <= 200) out.push(`${ch}:${v}`);
+    }
+    return out;
+  }
+
+  function normalizeCitations(raw) {
+    const out = [];
+    (raw || []).forEach((c) => {
+      let s = c;
+      if (Array.isArray(c)) {
+        if (c.length === 2 && Number.isFinite(+c[0]) && Number.isFinite(+c[1])) {
+          s = `${c[0]}:${c[1]}`;
+        } else {
+          s = c.join(':');
+        }
+      } else if (typeof c === 'object' && c) {
+        const ch = c.chapter ?? c.ch ?? c.c ?? c[0];
+        const v  = c.verse   ?? c.v ?? c[1];
+        if (ch && v) s = `${ch}:${v}`;
+      }
+      s = String(s).replace(/[^\d:.-]/g, '');
+      const m = /(\d{1,2})[:.](\d{1,3})/.exec(s);
+      if (m) out.push(`${+m[1]}:${+m[2]}`);
+    });
+    return Array.from(new Set(out));
+  }
+
   function renderCitations(citations, onExplain) {
     if (!citations || !citations.length) return null;
     const wrap = el('div', { class: 'citations', style: { display: 'flex', gap: '6px', flexWrap: 'wrap', fontSize: '12px' } });
@@ -140,6 +187,8 @@ const GitaWidget = (() => {
       .gw2 .sect { margin-top: 14px; }
       .gw2 .sect.title { font-weight: 800; }
       .gw2 .sect.transl { font-style: italic; }
+      .gw2 .wm-inline { margin-top: 12px; }
+      .gw2 .wm-key { font-weight: 800; }
     `);
 
     const wrap = el('div', { class: 'gw2' });
@@ -147,7 +196,7 @@ const GitaWidget = (() => {
     wrap.appendChild(style);
 
     const log = el('div', { class: 'log', role: 'log', 'aria-live': 'polite' });
-    const input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., Explain 2.47)', autocomplete: 'off' });
+    const input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., Explain 2.47 or nasato)', autocomplete: 'off' });
     const clearBtn = el('button', { class: 'clear', title: 'Clear conversation' }, 'Clear');
     const sendBtn = el('button', { class: 'send', title: 'Send' }, el('span', { class: 'arrow' }, '↑'));
 
@@ -168,13 +217,21 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
-      // Gather citations: explicit + found in text
-      let citeSet = new Set();
-      if (extras.citations && Array.isArray(extras.citations)) {
-        extras.citations.forEach(c => {
-          const m = /^(\d{1,2})[:.](\d{1,3})$/.exec(String(c));
-          if (m) citeSet.add(`${m[1]}:${m[2]}`);
+      // Normalize & extract citations for pills
+      const citeSet = new Set(normalizeCitations(extras.citations));
+      if (role === 'bot' && content && typeof content === 'object') {
+        ['answer','summary','title','translation','word_meanings'].forEach(k => {
+          if (content[k]) extractCitationsFromText(content[k]).forEach(cv => citeSet.add(cv));
         });
+      } else if (role === 'bot' && typeof content === 'string') {
+        extractCitationsFromText(content).forEach(cv => citeSet.add(cv));
+      }
+
+      // Render pills first (so they're easy to tap)
+      const cites = Array.from(citeSet);
+      if (cites.length) {
+        const pills = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
+        if (pills) msg.appendChild(pills);
       }
 
       if (role === 'user') {
@@ -182,33 +239,30 @@ const GitaWidget = (() => {
       } else {
         if (content && typeof content === 'object') {
           let any = false;
-          const rawTitle = toPlain(content.title || '');
-          if (rawTitle) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, rawTitle)); }
-          if (content.sanskrit) { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.sanskrit))); }
-          if (content.roman)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
-          if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
-          if (content.summary) { any = true; bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + toPlain(content.summary))); }
 
-          // Scan fields for inline refs
-          ['answer','summary','title','translation'].forEach(k => {
-            if (content[k]) extractCitationsFromText(content[k]).forEach(cv => citeSet.add(cv));
-          });
+          // Title (suppress "Word meaning ..." headings that might come from backend)
+          let rawTitle = toPlain(content.title || '');
+          if (/^\s*word\s*meaning\b/i.test(rawTitle)) rawTitle = '';
+          if (rawTitle) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, rawTitle)); }
+
+          if (content.sanskrit)   { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.sanskrit))); }
+          if (content.roman)      { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
+          if (content.translation){ any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
+
+          // **Word meanings within Explain** (no heading label; bold keys)
+          if (content.word_meanings) {
+            any = true;
+            bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
+          }
+
+          if (content.summary)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + toPlain(content.summary))); }
 
           const rest = content.answer;
           if (!any && rest) bubble.appendChild(el('div', {}, toPlain(rest)));
           if (!any && !rest) bubble.textContent = toPlain(JSON.stringify(content));
         } else {
-          const s = String(content || '');
-          extractCitationsFromText(s).forEach(cv => citeSet.add(cv));
-          bubble.textContent = toPlain(s);
+          bubble.textContent = toPlain(content);
         }
-      }
-
-      // Render citations pills (unique)
-      const cites = Array.from(citeSet);
-      if (cites.length) {
-        const c = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
-        if (c) msg.appendChild(c);
       }
 
       msg.appendChild(bubble);
@@ -274,4 +328,3 @@ const GitaWidget = (() => {
 })();
 
 if (typeof window !== 'undefined') window.GitaWidget = GitaWidget;
-
