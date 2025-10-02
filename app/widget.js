@@ -1,13 +1,14 @@
-// Gita Q&A v2 — Permanent build with:
-// - NO "Word meaning" pill/heading
-// - Explain shows word meanings inline (bold Sanskrit terms)
-// - Citations always clickable (from API or found in text)
-// - Plain text only; <br> -> \n
-// - Orange round send button; spinner replaces arrow
-// Version: v2.5-permanent-nowm-cites
+// Gita Q&A v2 — CLEAN FIX (no duplicate vars) 
+// Version: v2.6-clean
+// - Removes "Word meaning ..." pill/heading anywhere.
+// - Explain shows word meanings inline (bold Sanskrit terms), no "Word Meaning" label.
+// - Citations clickable: supports ["[2:16]"], "2.16", "[C:2:16]" and inline refs inside paragraphs.
+// - Plain-text only (<br> -> \n, strip tags).
+// - Orange round send button with short/thick ↑; spinner replaces arrow while sending.
+// - Single, consistent control declarations (no redeclare of input/clearBtn/sendBtn).
 
 const GitaWidget = (() => {
-  console.log('[GW] init v2.5-permanent-nowm-cites');
+  console.log('[GW] init v2.6-clean');
 
   // ---------- helpers ----------
   function el(tag, attrs = {}, ...children) {
@@ -56,7 +57,8 @@ const GitaWidget = (() => {
 
   // ---------- word meanings inline (bold keys) ----------
   function renderWordMeaningsInline(text) {
-    const container = el('div', { class: 'wm-inline' });
+    const container = document.createElement('div');
+    container.className = 'wm-inline';
     const clean = toPlain(text);
     const normalized = clean.replace(/\s*=\s*/g, ' — ');
     const parts = normalized.split(/;\s*/).map(s => s.trim()).filter(Boolean);
@@ -66,18 +68,30 @@ const GitaWidget = (() => {
       if (m) {
         const key = m[1].trim();
         const val = m[2].trim();
-        container.appendChild(el('span', { class: 'wm-key', style: { fontWeight: '800' } }, key));
-        container.appendChild(el('span', {}, ' — ' + val));
+        const keyEl = document.createElement('span');
+        keyEl.className = 'wm-key';
+        keyEl.style.fontWeight = '800';
+        keyEl.textContent = key;
+        container.appendChild(keyEl);
+        const valEl = document.createElement('span');
+        valEl.textContent = ' — ' + val;
+        container.appendChild(valEl);
       } else {
-        container.appendChild(el('span', {}, seg));
+        const span = document.createElement('span');
+        span.textContent = seg;
+        container.appendChild(span);
       }
-      if (i < parts.length - 1) container.appendChild(el('span', {}, '; '));
+      if (i < parts.length - 1) {
+        const sep = document.createElement('span');
+        sep.textContent = '; ';
+        container.appendChild(sep);
+      }
     });
     return container;
   }
 
   // ---------- citations (normalize + extract from text) ----------
-  const CITE_TEXT_RE = /(?:\[\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
+  const CITE_TEXT_RE = /(?:\[\s*)?(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
 
   function extractCitationsFromText(text) {
     const s = (text || '').toString();
@@ -205,6 +219,9 @@ const GitaWidget = (() => {
     wrap.appendChild(row);
     wrap.appendChild(pillbar);
     wrap.appendChild(debugToggle);
+
+    // attach to host
+    host.innerHTML = '';
     host.appendChild(wrap);
 
     function autoScroll() { log.scrollTop = log.scrollHeight; }
@@ -223,7 +240,7 @@ const GitaWidget = (() => {
         extractCitationsFromText(content).forEach(cv => citeSet.add(cv));
       }
 
-      // Render pills first for easy tapping
+      // Render pills first
       const cites = [...citeSet];
       if (cites.length) {
         const pills = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
@@ -261,6 +278,9 @@ const GitaWidget = (() => {
         }
       }
 
+      // Enhance inline refs inside text bubble into clickable micro-pills
+      enhanceInlineCitations(bubble, (ch, v) => doAsk(`Explain ${ch}.${v}`));
+
       msg.appendChild(bubble);
 
       // Debug payload
@@ -273,6 +293,38 @@ const GitaWidget = (() => {
 
       log.appendChild(msg);
       autoScroll();
+    }
+
+    // Inline citations inside paragraphs -> clickable
+    function enhanceInlineCitations(bubble, onExplain) {
+      const RE = CITE_TEXT_RE; // same pattern as above
+      const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, null);
+      const targets = [];
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) targets.push(n);
+      targets.forEach(node => {
+        const text = node.nodeValue;
+        if (!RE.test(text)) return;
+        RE.lastIndex = 0;
+        const frag = document.createDocumentFragment();
+        let last = 0, m;
+        while ((m = RE.exec(text))) {
+          const before = text.slice(last, m.index);
+          if (before) frag.appendChild(document.createTextNode(before));
+          const cv = `${+m[1]}:${+m[2]}`;
+          const btn = el('button', { class: 'citation-pill inline', title: `Explain ${cv}`, style: {
+            display:'inline-block', margin:'0 .25em', padding:'0 .5em',
+            borderRadius:'999px', border:'1px solid var(--c-border)',
+            background:'var(--c-pill-bg)', color:'var(--c-pill-fg)', cursor:'pointer',
+            fontSize:'0.9em', lineHeight:'1.6'
+          }}, cv);
+          btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onExplain && onExplain(+m[1], +m[2]); }, true);
+          frag.appendChild(btn);
+          last = RE.lastIndex;
+        }
+        const after = text.slice(last);
+        if (after) frag.appendChild(document.createTextNode(after));
+        node.parentNode.replaceChild(frag, node);
+      });
     }
 
     async function loadPills() {
@@ -291,7 +343,7 @@ const GitaWidget = (() => {
     async function doAsk(q) {
       pushMessage('user', q);
       try {
-        document.querySelector('.gw2 .send')?.classList.add('loading');
+        sendBtn.classList.add('loading');
         const res = await fetchJSON(`${apiBase}/ask`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -302,15 +354,11 @@ const GitaWidget = (() => {
       } catch (e) {
         pushMessage('bot', 'Error: ' + (e.message || e));
       } finally {
-        document.querySelector('.gw2 .send')?.classList.remove('loading');
+        sendBtn.classList.remove('loading');
       }
     }
 
-    // Wire controls
-    const input = host.querySelector('input[type="text"]') || document.querySelector('.gw2 input[type="text"]');
-    const clearBtn = host.querySelector('.clear') || document.querySelector('.gw2 .clear');
-    const sendBtn = host.querySelector('.send') || document.querySelector('.gw2 .send');
-
+    // Wire controls (single declarations)
     sendBtn.addEventListener('click', () => {
       const q = (input.value || '').trim();
       if (!q) return;
@@ -319,11 +367,9 @@ const GitaWidget = (() => {
       input.focus();
     });
     input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') sendBtn.click(); });
-    clearBtn.addEventListener('click', () => { const log = host.querySelector('.log'); if (log) log.innerHTML = ''; input.focus(); });
+    clearBtn.addEventListener('click', () => { log.innerHTML = ''; input.focus(); });
 
     // Init
-    const logEl = host.querySelector('.log');
-    if (!logEl) host.appendChild(el('div', { class: 'log' }));
     loadPills();
     return { ask: doAsk };
   }
