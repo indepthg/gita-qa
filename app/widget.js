@@ -1,17 +1,10 @@
-// Gita Q&A v2 — full widget (redo Word Meaning + thicker/shorter arrow in one place)
-//
-// What’s in here
-// - Word Meaning flow (e.g., “Word meaning 2.47” or “meaning 2.47”):
-//     Title (bold, fetched from /title/{ch}/{v}), then Sanskrit, Roman, and
-//     Word meanings INLINE with **bold keys** and an em-dash (—) separator.
-// - Explain flow stays the same (no “Word Meaning” label).
-// - Send button: orange round; default shows a short, thick ↑ arrow.
-//   While loading, arrow hides and a spinner appears INSIDE the circle.
-// - Citations are clickable 2:47 pills that trigger Explain for that verse.
-// - Plain-text rendering only (HTML stripped except our own UI).
+// Gita Q&A v2 — HOTFIX build
+// - Robust Word Meaning detection: formats BOTH `word_meanings` field and plain `answer` strings that look like word-meaning lists.
+// - Title for WM: prefer pretty title from /title/{ch}/{v}; suppress numeric-only like "2:47".
+// - Friendly error for invalid refs (e.g., 2.84).
+// - Arrow: short, thick ↑; spinner replaces arrow on send.
 
 const GitaWidget = (() => {
-  // ---------- helpers ----------
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -38,7 +31,6 @@ const GitaWidget = (() => {
     return r.json();
   }
 
-  // ---------- text cleaning (no HTML/MD from API) ----------
   function toPlain(text) {
     if (text == null) return '';
     let t = String(text)
@@ -57,7 +49,6 @@ const GitaWidget = (() => {
     return t;
   }
 
-  // ---------- citations: [C:V] -> clickable pill -> Explain ----------
   function renderCitations(citations, onExplain) {
     if (!citations || !citations.length) return null;
     const wrap = el('div', { class: 'citations', style: { display: 'flex', gap: '6px', flexWrap: 'wrap', fontSize: '12px' } });
@@ -65,41 +56,37 @@ const GitaWidget = (() => {
       const s = String(tag0).trim().replace(/^\[|\]$/g, '');
       const m = /^(\d{1,2})[:.-](\d{1,3})$/.exec(s);
       if (!m) return;
-      const label = `${m[1]}:${m[2]}`;
       const btn = el('button', {
         class: 'citation-pill',
         title: 'Explain this verse',
         style: {
-          borderRadius: '999px',
-          padding: '2px 8px',
-          border: '1px solid var(--c-border)',
-          cursor: 'pointer',
-          background: 'var(--c-pill-bg)',
-          color: 'var(--c-pill-fg)'
+          borderRadius: '999px', padding: '2px 8px', border: '1px solid var(--c-border)',
+          cursor: 'pointer', background: 'var(--c-pill-bg)', color: 'var(--c-pill-fg)'
         }
-      }, label);
+      }, `${m[1]}:${m[2]}`);
       btn.addEventListener('click', () => { onExplain && onExplain(m[1], m[2]); });
       wrap.appendChild(btn);
     });
     return wrap;
   }
 
-  // ---------- Word Meaning inline renderer (bold keys, em-dash) ----------
+  function looksLikeWordMeanings(s) {
+    if (!s) return false;
+    const t = toPlain(s);
+    return (/=/.test(t) && /;/.test(t)) || (t.match(/—/g) || []).length >= 2;
+  }
+
   function renderWordMeaningsInline(text) {
     const container = el('div', { class: 'wm-inline' });
     const clean = toPlain(text);
-    // Convert '=' to ' — ' for display
     const normalized = clean.replace(/\s*=\s*/g, ' — ');
     const parts = normalized.split(/;\s*/).map(s => s.trim()).filter(Boolean);
     if (!parts.length) { container.textContent = normalized; return container; }
-
     parts.forEach((seg, i) => {
       const m = /^(.*?)\s*—\s*(.+)$/.exec(seg);
       if (m) {
-        const key = m[1].trim();
-        const val = m[2].trim();
-        container.appendChild(el('span', { class: 'wm-key' }, key));
-        container.appendChild(el('span', {}, ' — ', val));
+        container.appendChild(el('span', { class: 'wm-key' }, m[1].trim()));
+        container.appendChild(el('span', {}, ' — ', m[2].trim()));
       } else {
         container.appendChild(el('span', {}, seg));
       }
@@ -108,7 +95,6 @@ const GitaWidget = (() => {
     return container;
   }
 
-  // ---------- mode detection ----------
   function detectMode(q) {
     const s = (q || '').trim().toLowerCase();
     if (/^(word\s*meaning|meaning)\b/.test(s)) return 'wm';
@@ -116,21 +102,28 @@ const GitaWidget = (() => {
     return '';
   }
 
-  // ---------- fetch pretty title for WM ----------
-  async function fetchTitleForWM(q, apiBase) {
-    const m = /\b(?:word\s*meaning|meaning)\s+(\d{1,2})[.:](\d{1,3})/i.exec(q);
-    if (!m) return null;
-    const ch = m[1], v = m[2];
+  async function fetchPrettyTitle(q, apiBase) {
+    const m = /\b(?:word\s*meaning|meaning)\s+(\d{1,2})[.:](\d{1,3})/i.exec(q || '');
+    if (!m) return '';
     try {
-      const j = await fetchJSON(`${apiBase}/title/${ch}/${v}`);
-      const t = toPlain(j?.title || j?.result || j?.answer || '');
-      return t;
-    } catch {
-      return '';
-    }
+      const j = await fetchJSON(`${apiBase}/title/${m[1]}/${m[2]}`);
+      return toPlain(j?.title || j?.result || j?.answer || '');
+    } catch { return ''; }
   }
 
-  // ---------- mount ----------
+  const GITA_VERSE_COUNTS = [0,47,72,43,42,29,47,30,28,34,42,55,20,35,27,20,24,28,78];
+  function extractRef(q) {
+    const m = /(\d{1,2})[.:](\d{1,3})/.exec(q || '');
+    return m ? { ch: +m[1], v: +m[2] } : null;
+  }
+  function validateRef(q) {
+    const ref = extractRef(q); if (!ref) return { ok:true };
+    const { ch, v } = ref;
+    if (ch < 1 || ch > 18) return { ok:false, ch, v, max:0 };
+    const max = GITA_VERSE_COUNTS[ch];
+    return { ok: v >= 1 && v <= max, ch, v, max };
+  }
+
   function mount({ root, apiBase }) {
     const host = typeof root === 'string' ? document.querySelector(root) : root;
     if (!host) throw new Error('Root element not found');
@@ -159,7 +152,7 @@ const GitaWidget = (() => {
       .gw2 input[type="text"] { flex: 1; padding: 14px; border: 1px solid var(--c-border); border-radius: 10px; background: transparent; color: var(--c-fg); font-size: 18px; }
       .gw2 .clear { padding: 10px 12px; border: 1px solid var(--c-border); background: transparent; border-radius: 8px; cursor: pointer; color: var(--c-fg); }
       .gw2 .send { width: 42px; height: 42px; border-radius: 999px; border: 2px solid var(--c-accent-border); background: var(--c-accent); color: #fff; cursor: pointer; display: grid; place-items: center; line-height: 1; position: relative; }
-      .gw2 .send .arrow { font-size: 22px; font-weight: 900; transform: scaleX(1.2) scaleY(0.55); } /* thicker + shorter */
+      .gw2 .send .arrow { font-size: 22px; font-weight: 900; transform: scaleX(1.3) scaleY(0.5); }
       .gw2 .send:hover { transform: translateY(-1px); }
       .gw2 .send:active { transform: translateY(0); }
       .gw2 .send.loading .arrow { visibility: hidden; }
@@ -188,30 +181,23 @@ const GitaWidget = (() => {
     const input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., 2.47 meaning)', autocomplete: 'off' });
     const clearBtn = el('button', { class: 'clear', title: 'Clear conversation' }, 'Clear');
     const sendBtn = el('button', { class: 'send', title: 'Send' }, el('span', { class: 'arrow' }, '↑'));
-
     const row = el('div', { class: 'row' }, input, clearBtn, sendBtn);
     const pillbar = el('div', { class: 'pillbar' });
     const debugToggle = el('label', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px', fontSize: '12px', color: 'var(--c-muted)' } },
       el('input', { type: 'checkbox', id: 'gw2-debug' }), 'Debug');
 
-    wrap.appendChild(log);
-    wrap.appendChild(row);
-    wrap.appendChild(pillbar);
-    wrap.appendChild(debugToggle);
+    wrap.appendChild(log); wrap.appendChild(row); wrap.appendChild(pillbar); wrap.appendChild(debugToggle);
     host.appendChild(wrap);
 
     function autoScroll() { log.scrollTop = log.scrollHeight; }
 
-    // ---------- message rendering ----------
     function pushMessage(role, content, extras = {}) {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
-
       const asked = extras.asked || '';
       const mode = extras.mode || detectMode(asked);
       const isExplainMode = mode === 'explain' || (extras?.raw?.mode === 'explain');
 
-      // Show citation pills above non-Explain answers
       if (role === 'bot' && !isExplainMode && extras.citations && extras.citations.length) {
         const c = renderCitations(extras.citations, (ch, v) => doAsk(`Explain ${ch}.${v}`));
         if (c) msg.appendChild(c);
@@ -224,51 +210,49 @@ const GitaWidget = (() => {
           let any = false;
 
           if (mode === 'wm') {
-            // Word Meaning MODE
-            const titleText = extras.prettyTitle || '';
-            if (titleText) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, titleText)); }
+            const pretty = extras.prettyTitle || '';
+            const rawTitle = toPlain(content.title || '');
+            const looksLikeRef = /^\s*\d{1,2}[.:]\d{1,3}\s*$/.test(rawTitle);
+            const title = pretty || (looksLikeRef ? '' : rawTitle);
+            if (title) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, title)); }
             if (content.sanskrit) { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.sanskrit))); }
             if (content.roman)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
             if (content.word_meanings) { any = true; bubble.appendChild(renderWordMeaningsInline(content.word_meanings)); }
+            else if (content.answer && looksLikeWordMeanings(content.answer)) { any = true; bubble.appendChild(renderWordMeaningsInline(content.answer)); }
           } else {
-            // Default / Explain
             const rawTitle = toPlain(content.title || '');
             if (rawTitle) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, rawTitle)); }
             if (content.sanskrit) { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.sanskrit))); }
             if (content.roman)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
             if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
-            if (content.word_meanings) { any = true; bubble.appendChild(renderWordMeaningsInline(content.word_meanings)); } // no label
+            if (content.word_meanings) { any = true; bubble.appendChild(renderWordMeaningsInline(content.word_meanings)); }
+            else if (content.answer && looksLikeWordMeanings(content.answer)) { any = true; bubble.appendChild(renderWordMeaningsInline(content.answer)); }
             if (content.summary) { any = true; bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + toPlain(content.summary))); }
             const rest = content.answer;
             if (!any && rest) bubble.appendChild(el('div', {}, toPlain(rest)));
             if (!any && !rest) bubble.textContent = toPlain(JSON.stringify(content));
           }
         } else {
-          bubble.textContent = toPlain(content);
+          const s = String(content || '');
+          if (looksLikeWordMeanings(s)) bubble.appendChild(renderWordMeaningsInline(s));
+          else bubble.textContent = toPlain(s);
         }
       }
 
       msg.appendChild(bubble);
-
-      // Citations under Explain too
       if (extras.citations && extras.citations.length && isExplainMode) {
         const c = renderCitations(extras.citations, (ch, v) => doAsk(`Explain ${ch}.${v}`));
         if (c) msg.appendChild(c);
       }
-
-      // Debug payload
       if ((document.getElementById('gw2-debug') || {}).checked && extras.raw) {
         const d = el('details', { class: 'debug' }, el('summary', {}, 'Debug payload'));
         d.appendChild(el('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(extras.raw, null, 2)));
         if (extras.raw.fts_query) d.appendChild(el('div', {}, 'fts_query: ' + extras.raw.fts_query));
         msg.appendChild(d);
       }
-
-      log.appendChild(msg);
-      autoScroll();
+      log.appendChild(msg); autoScroll();
     }
 
-    // ---------- suggestions ----------
     async function loadPills() {
       try {
         const s = await fetchJSON(`${apiBase}/suggest`);
@@ -280,20 +264,25 @@ const GitaWidget = (() => {
       } catch {}
     }
 
-    // ---------- ask ----------
     async function doAsk(q) {
       pushMessage('user', q);
+      const validity = validateRef(q);
+      if (!validity.ok) {
+        const msg = `Chapter ${validity.ch}, Verse ${validity.v} does not exist (max is ${validity.max}).`;
+        pushMessage('bot', msg, { asked: q });
+        return;
+      }
+
       const mode = detectMode(q);
       let prettyTitle = '';
-      if (mode === 'wm') prettyTitle = await fetchTitleForWM(q, apiBase);
+      if (mode === 'wm') prettyTitle = await fetchPrettyTitle(q, apiBase);
 
       try {
         sendBtn.classList.add('loading');
-        const payload = { question: q, topic: 'gita' };
         const res = await fetchJSON(`${apiBase}/ask`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+          body: JSON.stringify({ question: q, topic: 'gita' })
         });
         const citations = Array.isArray(res.citations) ? res.citations : [];
         pushMessage('bot', res.answer ?? res, { citations, raw: res, asked: q, mode, prettyTitle });
@@ -304,18 +293,14 @@ const GitaWidget = (() => {
       }
     }
 
-    // ---------- controls ----------
     sendBtn.addEventListener('click', () => {
       const q = (input.value || '').trim();
       if (!q) return;
-      input.value = '';
-      doAsk(q);
-      input.focus();
+      input.value=''; doAsk(q); input.focus();
     });
     input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') sendBtn.click(); });
     clearBtn.addEventListener('click', () => { log.innerHTML = ''; input.focus(); });
 
-    // ---------- init ----------
     loadPills();
     return { ask: doAsk };
   }
