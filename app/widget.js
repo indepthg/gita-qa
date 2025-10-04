@@ -1,11 +1,19 @@
-// Gita Q&A v2 — CLEAN FIX (no duplicate vars) 
-// Version: v2.6.1-clean (closure fix for citation clicks)
-// - Fix: citation button listeners now capture ch/v correctly (no null m).
-// - All other behavior same as v2.6-clean.
+// Gita Q&A v2 — bundled widget with dynamic follow-ups
+// Version: v2.7 (dynamic pills, self-citation hide, "More detail", closure-safe cites)
+// - Plain-text only rendering (no HTML/Markdown).
+// - Clickable citations (top + inline inside paragraphs) -> Explain C.V.
+// - Hides self-citation pill for Explain C.V.
+// - Word meanings inline with bold Sanskrit keys (no "Word Meaning" label).
+// - Follow-up chips under each bot answer:
+//    * "More detail" (uses your requested wording)
+//    * 2–3 dynamic, model-generated follow-up questions (secondary /ask)
+// - Orange round send button; spinner while sending.
+// Use with a dynamic cache-busting loader in your HTML (already added in main.py).
+
+console.log('[GW] widget v2.7 loaded', new Date().toISOString());
 
 const GitaWidget = (() => {
-  console.log('[GW] init v2.6.1-clean');
-
+  // ---------- small helpers ----------
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -31,6 +39,7 @@ const GitaWidget = (() => {
     return r.json();
   }
 
+  // ---------- plain text ----------
   function toPlain(text) {
     if (text == null) return '';
     let t = String(text)
@@ -49,6 +58,7 @@ const GitaWidget = (() => {
     return t;
   }
 
+  // ---------- word meanings inline (bold keys) ----------
   function renderWordMeaningsInline(text) {
     const container = document.createElement('div');
     container.className = 'wm-inline';
@@ -83,6 +93,7 @@ const GitaWidget = (() => {
     return container;
   }
 
+  // ---------- citations utilities ----------
   const CITE_TEXT_RE = /(?:\[\s*)?(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
 
   function extractCitationsFromText(text) {
@@ -144,6 +155,45 @@ const GitaWidget = (() => {
     return wrap;
   }
 
+  // ---------- follow-up bar ----------
+  function addFollowupBar(container, items) {
+    if (!items || !items.length) return;
+    const bar = document.createElement('div');
+    bar.className = 'pillbar';
+    items.forEach(({label, onClick}) => {
+      const b = document.createElement('button');
+      b.className = 'pill';
+      b.textContent = label;
+      b.addEventListener('click', onClick);
+      bar.appendChild(b);
+    });
+    container.appendChild(bar);
+  }
+
+  async function generateDynamicPillsFromAnswer(apiBase, lastAnswerText) {
+    const meta = [
+      "Based on the answer below, propose 2–3 short follow-up questions that let the user go deeper into under-covered commentary and important cross-references.",
+      "Each 30–55 characters, plain text, no quotes or markdown, no internal field names.",
+      "Avoid repeating the last question. Prefer distinct angles (analysis, practice, cross-refs).",
+      "Return one per line, nothing else.",
+      "", "Answer:", lastAnswerText
+    ].join("\n");
+
+    try {
+      const res = await fetchJSON(`${apiBase}/ask`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: meta, topic: 'gita' })
+      });
+      const raw = (res && (res.answer || res)) || '';
+      const lines = String(raw).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      const uniq = [...new Set(lines)].filter(s => s.length >= 18 && s.length <= 70);
+      return uniq.slice(0, 3).map(text => ({ label: text, onClick: () => doAsk(text) }));
+    } catch {
+      return [];
+    }
+  }
+
+  // ---------- mount ----------
   function mount({ root, apiBase }) {
     const host = typeof root === 'string' ? document.querySelector(root) : root;
     if (!host) throw new Error('Root element not found');
@@ -183,7 +233,6 @@ const GitaWidget = (() => {
       }
       @keyframes gw2spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       .gw2 .pillbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-      .gw2 .pill { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--c-border); background: var(--c-pill-bg); color: var(--c-pill-fg); cursor: pointer; }
       .gw2 details.debug { margin-top: 6px; font-size: 12px; color: var(--c-muted); }
       .gw2 .citations { margin: 6px 0 6px; }
       .gw2 .sect { margin-top: 14px; }
@@ -221,6 +270,7 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
+      // Build citation set
       const citeSet = new Set(normalizeCitations(extras.citations));
       if (role === 'bot' && content && typeof content === 'object') {
         ['answer','summary','title','translation','word_meanings'].forEach(k => {
@@ -230,7 +280,16 @@ const GitaWidget = (() => {
         extractCitationsFromText(content).forEach(cv => citeSet.add(cv));
       }
 
-      const cites = [...citeSet];
+      // If this was "Explain C.V", drop self-citation
+      let askedCV = null;
+      if (extras && typeof extras.asked === 'string') {
+        const m = /^\s*explain\s+(\d{1,2})[.:](\d{1,3})/i.exec(extras.asked);
+        if (m) askedCV = `${+m[1]}:${+m[2]}`;
+      }
+
+      let cites = [...new Set([...citeSet])];
+      if (askedCV) cites = cites.filter(cv => cv !== askedCV);
+
       if (cites.length) {
         const pills = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
         if (pills) msg.appendChild(pills);
@@ -242,6 +301,7 @@ const GitaWidget = (() => {
         if (content && typeof content === 'object') {
           let any = false;
 
+          // Title (suppress any "Word meaning ..." headings)
           let rawTitle = toPlain(content.title || '');
           if (/^\s*word\s*meaning\b/i.test(rawTitle)) rawTitle = '';
           if (rawTitle) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, rawTitle)); }
@@ -250,6 +310,7 @@ const GitaWidget = (() => {
           if (content.roman)       { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
           if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
 
+          // Word meanings (inline, bold keys)
           if (content.word_meanings) {
             any = true;
             bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
@@ -265,10 +326,12 @@ const GitaWidget = (() => {
         }
       }
 
+      // Enhance inline refs inside bubble into clickable micro-pills
       enhanceInlineCitations(bubble, (ch, v) => doAsk(`Explain ${ch}.${v}`));
 
       msg.appendChild(bubble);
 
+      // Debug payload
       if ((document.getElementById('gw2-debug') || {}).checked && extras.raw) {
         const d = el('details', { class: 'debug' }, el('summary', {}, 'Debug payload'));
         d.appendChild(el('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(extras.raw, null, 2)));
@@ -276,10 +339,52 @@ const GitaWidget = (() => {
         msg.appendChild(d);
       }
 
+      // FOLLOW-UP CHIPS (More detail + dynamic)
+      if (role === 'bot') {
+        // Compose a plain-text version of just-displayed content
+        let lastAnswerText = '';
+        if (typeof content === 'string') {
+          lastAnswerText = toPlain(content);
+        } else if (content && typeof content === 'object') {
+          const bits = [];
+          if (content.title) bits.push(toPlain(content.title));
+          if (content.sanskrit) bits.push(toPlain(content.sanskrit));
+          if (content.roman) bits.push(toPlain(content.roman));
+          if (content.translation) bits.push(toPlain(content.translation));
+          if (content.summary) bits.push('Summary: ' + toPlain(content.summary));
+          if (content.answer) bits.push(toPlain(content.answer));
+          if (content.word_meanings) bits.push(toPlain(content.word_meanings));
+          lastAnswerText = bits.join('\n').trim();
+        }
+
+        // Default "More detail" pill
+        const moreDetail = (() => {
+          const q = (extras && extras.asked) || '';
+          const m = /^\s*explain\s+(\d{1,2})[.:](\d{1,3})/i.exec(q);
+          const label = 'More detail';
+          if (m) {
+            const cv = `${+m[1]}.${+m[2]}`;
+            return { label, onClick: () => doAsk(`Explain ${cv} — more detail. Include additional commentary and context.`) };
+          }
+          if (q) return { label, onClick: () => doAsk(`${q} — more detail. Include additional commentary and context.`) };
+          return null;
+        })();
+
+        (async () => {
+          const pills = [];
+          if (moreDetail) pills.push(moreDetail);
+          const dyn = await generateDynamicPillsFromAnswer(apiBase, lastAnswerText);
+          const seen = new Set(pills.map(p => p.label));
+          dyn.forEach(p => { if (!seen.has(p.label)) pills.push(p); });
+          addFollowupBar(msg, pills.slice(0, 3)); // cap to 3 total
+        })();
+      }
+
       log.appendChild(msg);
       autoScroll();
     }
 
+    // turn inline 2:63 / [2:63] / C:2:63 into clickable micro-pills
     function enhanceInlineCitations(bubble, onExplain) {
       const RE = CITE_TEXT_RE;
       const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, null);
@@ -306,7 +411,7 @@ const GitaWidget = (() => {
           frag.appendChild(btn);
           last = RE.lastIndex;
         }
-        const after = text.slice(last);
+        const after = text.slice[last);
         if (after) frag.appendChild(document.createTextNode(after));
         node.parentNode.replaceChild(frag, node);
       });
@@ -316,8 +421,11 @@ const GitaWidget = (() => {
       try {
         const s = await fetchJSON(`${apiBase}/suggest`);
         (s.suggestions || []).forEach(text => {
+          // Drop any "Word meaning ..." suggestion pill
           if (/^\s*word\s*meaning\b/i.test(text)) return;
-          const b = el('button', { class: 'pill' }, text);
+          const b = document.createElement('button');
+          b.className = 'pill';
+          b.textContent = text;
           b.addEventListener('click', () => doAsk(text));
           pillbar.appendChild(b);
         });
@@ -342,6 +450,7 @@ const GitaWidget = (() => {
       }
     }
 
+    // wire controls
     sendBtn.addEventListener('click', () => {
       const q = (input.value || '').trim();
       if (!q) return;
