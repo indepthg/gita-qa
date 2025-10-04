@@ -1,31 +1,22 @@
 /* Gita Q&A v2 — widget
-   Version: v2.7.1 (fix: SyntaxError guard, self-citation hide, dynamic follow-ups)
+   Version: v2.7.2 (fix: duplicate identifier; self-citation hide; dynamic follow-ups)
 */
-console.log('[GW] widget v2.7.1 loaded', new Date().toISOString());
+console.log('[GW] widget v2.7.2 loaded', new Date().toISOString());
 
 const GitaWidget = (() => {
+  // ---------- helpers ----------
   function el(tag, attrs, ...children) {
     const e = document.createElement(tag);
     if (attrs && typeof attrs === 'object') {
       for (const k in attrs) {
         const v = attrs[k];
-        if (k === 'style' && v && typeof v === 'object') {
-          Object.assign(e.style, v);
-        } else if (k.slice(0,2) === 'on' && typeof v === 'function') {
-          e.addEventListener(k.slice(2), v);
-        } else if (k === 'class') {
-          e.className = v;
-        } else {
-          e.setAttribute(k, v);
-        }
+        if (k === 'style' && v && typeof v === 'object') Object.assign(e.style, v);
+        else if (k.slice(0,2) === 'on' && typeof v === 'function') e.addEventListener(k.slice(2), v);
+        else if (k === 'class') e.className = v;
+        else e.setAttribute(k, v);
       }
     }
-    const flat = [];
-    for (const c of children) {
-      if (Array.isArray(c)) flat.push(...c);
-      else flat.push(c);
-    }
-    for (const c of flat) {
+    for (const c of (children || []).flat ? children.flat() : children) {
       if (c == null) continue;
       e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
     }
@@ -38,10 +29,7 @@ const GitaWidget = (() => {
 
   function fetchJSON(url, opts) {
     return fetch(url, opts).then(async (r) => {
-      if (!r.ok) {
-        const t = await r.text().catch(()=>''); 
-        throw new Error(t || ('HTTP ' + r.status));
-      }
+      if (!r.ok) throw new Error((await r.text().catch(()=>'')) || ('HTTP ' + r.status));
       return r.json();
     });
   }
@@ -64,6 +52,7 @@ const GitaWidget = (() => {
     return t;
   }
 
+  // word meanings inline
   function renderWordMeaningsInline(text) {
     const container = document.createElement('div');
     container.className = 'wm-inline';
@@ -98,15 +87,15 @@ const GitaWidget = (() => {
     return container;
   }
 
+  // citations
   const CITE_TEXT_RE = /(?:\[\s*)?(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
 
   function extractCitationsFromText(text) {
     const s = (text || '').toString();
-    const out = new Set();
-    let m;
+    const out = new Set(); let m;
     while ((m = CITE_TEXT_RE.exec(s))) {
       const ch = +m[1], v = +m[2];
-      if (ch >= 1 && ch <= 18 && v >= 1 && v <= 200) out.add(ch + ':' + v);
+      if (ch>=1 && ch<=18 && v>=1 && v<=200) out.add(ch + ':' + v);
     }
     return Array.from(out);
   }
@@ -116,11 +105,8 @@ const GitaWidget = (() => {
     (raw || []).forEach((c) => {
       let s = c;
       if (Array.isArray(c)) {
-        if (c.length === 2 && Number.isFinite(+c[0]) && Number.isFinite(+c[1])) {
-          s = c[0] + ':' + c[1];
-        } else {
-          s = c.join(':');
-        }
+        if (c.length === 2 && Number.isFinite(+c[0]) && Number.isFinite(+c[1])) s = c[0] + ':' + c[1];
+        else s = c.join(':');
       } else if (c && typeof c === 'object') {
         const ch = c.chapter || c.ch || c.c || c[0];
         const v  = c.verse   || c.v  || c[1];
@@ -191,11 +177,10 @@ const GitaWidget = (() => {
       const lines = String(raw).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
       const uniq = Array.from(new Set(lines)).filter(s => s.length >= 18 && s.length <= 70);
       return uniq.slice(0, 3).map((text) => ({ label: text, onClick: () => doAsk(text) }));
-    }).catch(() => {
-      return [];
-    });
+    }).catch(() => []);
   }
 
+  // ---------- mount ----------
   function mount(opts) {
     const root = opts && opts.root;
     const apiBase = opts && (typeof opts.apiBase === 'string' ? opts.apiBase : '');
@@ -215,6 +200,7 @@ const GitaWidget = (() => {
       '--c-accent-border': '#e07a00'
     };
 
+    // styles
     const style = el('style', {}, [
       '.gw2 *{box-sizing:border-box;}',
       '.gw2{background:var(--c-bg);color:var(--c-fg);border:1px solid var(--c-border);border-radius:10px;padding:12px;}',
@@ -242,6 +228,7 @@ const GitaWidget = (() => {
       '.gw2 .wm-key{font-weight:800;}'
     ].join(''));
 
+    // build DOM
     const wrap = el('div', { class: 'gw2' });
     for (const k in vars) wrap.style.setProperty(k, vars[k]);
     wrap.appendChild(style);
@@ -250,7 +237,6 @@ const GitaWidget = (() => {
     const input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., Explain 2.47 or nasato)', autocomplete: 'off' });
     const clearBtn = el('button', { class: 'clear', title: 'Clear conversation' }, 'Clear');
     const sendBtn = el('button', { class: 'send', title: 'Send' }, el('span', { class: 'arrow' }, '↑'));
-
     const row = el('div', { class: 'row' }, input, clearBtn, sendBtn);
     const pillbar = el('div', { class: 'pillbar' });
     const debugToggle = el('label', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px', fontSize: '12px', color: 'var(--c-muted)' } },
@@ -266,6 +252,7 @@ const GitaWidget = (() => {
 
     function autoScroll() { log.scrollTop = log.scrollHeight; }
 
+    // inline citation enhancer
     function enhanceInlineCitations(bubble, onExplain) {
       const RE = CITE_TEXT_RE;
       const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, null);
@@ -292,7 +279,7 @@ const GitaWidget = (() => {
           frag.appendChild(btn);
           last = RE.lastIndex;
         }
-        const after = text.slice(last);
+        const after = text.slice[last);
         if (after) frag.appendChild(document.createTextNode(after));
         node.parentNode.replaceChild(frag, node);
       });
@@ -303,6 +290,7 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
+      // collect citations
       const citeSet = new Set(normalizeCitations(extras.citations));
       if (role === 'bot' && content && typeof content === 'object') {
         ['answer','summary','title','translation','word_meanings'].forEach((k) => {
@@ -312,20 +300,20 @@ const GitaWidget = (() => {
         extractCitationsFromText(content).forEach((cv) => citeSet.add(cv));
       }
 
+      // self-citation drop for Explain
       let askedCV = null;
       if (extras && typeof extras.asked === 'string') {
         const m = /^\s*explain\s+(\d{1,2})[.:](\d{1,3})/i.exec(extras.asked);
         if (m) askedCV = (+m[1]) + ':' + (+m[2]);
       }
-
       let cites = Array.from(new Set(Array.from(citeSet)));
       if (askedCV) cites = cites.filter((cv) => cv !== askedCV);
-
       if (cites.length) {
         const pills = renderCitations(cites, (ch, v) => doAsk('Explain ' + ch + '.' + v));
         if (pills) msg.appendChild(pills);
       }
 
+      // render content
       if (role === 'user') {
         bubble.textContent = content;
       } else {
@@ -347,22 +335,26 @@ const GitaWidget = (() => {
         }
       }
 
+      // inline cite enhancer
       enhanceInlineCitations(bubble, (ch, v) => doAsk('Explain ' + ch + '.' + v));
 
       msg.appendChild(bubble);
 
-      if ((document.getElementById('gw2-debug') || {}).checked && extras.raw) {
+      // debug
+      const dbg = document.getElementById('gw2-debug');
+      if (dbg && dbg.checked && extras.raw) {
         const d = el('details', { class: 'debug' }, el('summary', {}, 'Debug payload'));
         d.appendChild(el('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(extras.raw, null, 2)));
         if (extras.raw.fts_query) d.appendChild(el('div', {}, 'fts_query: ' + extras.raw.fts_query));
         msg.appendChild(d);
       }
 
+      // follow-up chips (More detail + dynamic)
       if (role === 'bot') {
+        // flatten last answer text
         let lastAnswerText = '';
-        if (typeof content === 'string') {
-          lastAnswerText = toPlain(content);
-        } else if (content && typeof content === 'object') {
+        if (typeof content === 'string') lastAnswerText = toPlain(content);
+        else if (content && typeof content === 'object') {
           const bits = [];
           if (content.title) bits.push(toPlain(content.title));
           if (content.sanskrit) bits.push(toPlain(content.sanskrit));
@@ -412,7 +404,7 @@ const GitaWidget = (() => {
           b.addEventListener('click', function () { doAsk(text); });
           pillbar.appendChild(b);
         });
-      }).catch(function(){ /* ignore */ });
+      }).catch(function(){});
     }
 
     function doAsk(q) {
@@ -431,28 +423,6 @@ const GitaWidget = (() => {
         sendBtn.classList.remove('loading');
       });
     }
-
-    const wrap = el('div', { class: 'gw2' }); // created earlier, but needed here to hold scope
-    const log = el('div', { class: 'log', role: 'log', 'aria-live': 'polite' });
-    const input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., Explain 2.47 or nasato)', autocomplete: 'off' });
-    const clearBtn = el('button', { class: 'clear', title: 'Clear conversation' }, 'Clear');
-    const sendBtn = el('button', { class: 'send', title: 'Send' }, el('span', { class: 'arrow' }, '↑'));
-    const row = el('div', { class: 'row' }, input, clearBtn, sendBtn);
-    const pillbar = el('div', { class: 'pillbar' });
-    const debugToggle = el('label', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px', fontSize: '12px', color: 'var(--c-muted)' } },
-      el('input', { type: 'checkbox', id: 'gw2-debug' }), 'Debug');
-
-    // styles (append created earlier)
-    const styleEl = el('style', {}); // placeholder (already added)
-    // Compose tree
-    wrap.appendChild(style);
-    wrap.appendChild(log);
-    wrap.appendChild(row);
-    wrap.appendChild(pillbar);
-    wrap.appendChild(debugToggle);
-
-    if (host.firstChild) host.innerHTML = '';
-    host.appendChild(wrap);
 
     // wire controls
     sendBtn.addEventListener('click', function () {
@@ -474,7 +444,7 @@ const GitaWidget = (() => {
     return { ask: doAsk };
   }
 
-  return { mount: mount };
+  return { mount };
 })();
 
 if (typeof window !== 'undefined') window.GitaWidget = GitaWidget;
