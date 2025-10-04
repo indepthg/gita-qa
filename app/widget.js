@@ -279,7 +279,7 @@ const GitaWidget = (() => {
           frag.appendChild(btn);
           last = RE.lastIndex;
         }
-        const after = text.slice[last);
+        const after = text.slice(last);
         if (after) frag.appendChild(document.createTextNode(after));
         node.parentNode.replaceChild(frag, node);
       });
