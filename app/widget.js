@@ -1,32 +1,31 @@
-/* Gita Q&A v2 — field-select widget (natural language, AND support)
-   Version: fields-v1
-   - Natural-language detection of Chapter/Verse and field(s) (supports "and")
-   - Mapping block at top for easy edits (synonyms → canonical fields)
-   - "Commentary" (generic) dumps both Commentary1 (Śaṅkara) + Commentary2
-   - If no fields specified → falls back to normal ask behavior (Explain or term search)
-   - Plain-text only; clickable [C:V] citations; bold keys for word meanings
-   - Friendly error for invalid verse like 2.84
-   Usage: <script src="/static/widget.js?v=Date.now()"></script>
-          GitaWidget.mount({ root: '#gita', apiBase: '' });
+/* Gita Q&A v2 — field-select widget (NL + AND), minimal UI, ES5-safe
+   Version: fields-v1.0.1 (syntax-hardened)
+   Notes:
+   - Natural-language: "2.10 Sanskrit", "Shankara commentary for 2-10",
+     "2:10 English and Meaning", "commentary for chapter 2 verse 10"
+   - "English" = Transliteration (roman). "Meaning"/"Translation" = translation.
+   - "Commentary" (generic) => Commentary1 (Śaṅkara) + Commentary2.
+   - If no field words found -> normal ask (Explain / free Q).
+   - Plain text only; clickable [C:V] citations; bold keys for word meanings.
+   - Friendly error for obviously invalid verses (e.g., 2.84).
+   - Minimal UI: no global CSS; keeps existing look.
 */
 
-console.log('[GW] widget fields-v1 loaded', new Date().toISOString());
+(function (global) {
+  'use strict';
 
-var GitaWidget = (function () {
-  // ---- EDITABLE FIELD MAPPINGS (synonyms → canonical DB fields) ----
-  // You can freely add/remove synonyms here.
+  // ========= EDITABLE FIELD MAPPINGS =========
   var FIELD_SYNONYMS = {
     sanskrit:        ["sanskrit"],
-    roman:           ["transliteration", "roman", "english"], // per your choice: "English" means roman
-    colloquial:      ["colloquial", "simple"],                 // remove/rename if you don't like "colloquial"
+    roman:           ["transliteration", "roman", "english"],
+    colloquial:      ["colloquial", "simple"],
     translation:     ["translation", "meaning", "rendering"],
     word_meanings:   ["word meaning", "word meanings", "word-by-word", "word by word", "padartha"],
     commentary1:     ["shankara", "śaṅkara", "shankaracharya", "commentary 1", "commentary1"],
     commentary2:     ["commentary 2", "commentary2", "modern commentary"],
-    all_commentaries:["commentary", "all commentary", "all commentaries"] // expands to commentary1+commentary2
+    all_commentaries:["commentary", "all commentary", "all commentaries"]
   };
 
-  // Labels for display (left side headings when multiple fields are requested)
   var FIELD_LABEL = {
     sanskrit: "Sanskrit",
     roman: "Transliteration",
@@ -37,14 +36,15 @@ var GitaWidget = (function () {
     commentary2: "Commentary 2"
   };
 
-  // ---- tiny helpers ----
+  // ========= small helpers =========
   function el(tag, attrs) {
     var e = document.createElement(tag);
     if (attrs && typeof attrs === 'object') {
       for (var k in attrs) {
+        if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
         var v = attrs[k];
         if (k === 'style' && v && typeof v === 'object') {
-          for (var sk in v) { try { e.style[sk] = v[sk]; } catch(_){} }
+          for (var sk in v) { if (Object.prototype.hasOwnProperty.call(v, sk)) { try { e.style[sk] = v[sk]; } catch(_){} } }
         } else if (k.slice(0,2) === 'on' && typeof v === 'function') {
           e.addEventListener(k.slice(2), v);
         } else if (k === 'class') {
@@ -70,11 +70,6 @@ var GitaWidget = (function () {
     return e;
   }
 
-  function prefersDark() {
-    try { return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches); }
-    catch(_) { return false; }
-  }
-
   function fetchJSON(url, opts) {
     return fetch(url, opts).then(function (r) {
       if (!r.ok) return r.text().then(function(t){ throw new Error(t || ('HTTP ' + r.status)); });
@@ -82,33 +77,25 @@ var GitaWidget = (function () {
     });
   }
 
+  // Hardened: no stray line breaks inside string literals
   function toPlain(text) {
     if (text == null) return '';
-    var t = String(text)
-      .replace(/<\s*br\s*\/?\s*>/gi, '
-')
-      .replace(/<[^>]+>/g, '')
-      .replace(/
-?| | /g, '
-');
-    t = t.replace(/&nbsp;/g, ' ')
-         .replace(/&amp;/g, '&')
-         .replace(/&lt;/g, '<')
-         .replace(/&gt;/g, '>')
-         .replace(/&quot;/g, '"')
-         .replace(/&#39;/g, "'")
-         .replace(/[ 	]+
-/g, '
-')
-         .replace(/
-{3,}/g, '
-
-')
-         .trim();
+    var t = String(text);
+    t = t.replace(/<\s*br\s*\/?\s*>/gi, '\\n');
+    t = t.replace(/<[^>]+>/g, '');
+    t = t.replace(/\r\n?|\u2028|\u2029/g, '\\n');
+    t = t.replace(/&nbsp;/g, ' ');
+    t = t.replace(/&amp;/g, '&');
+    t = t.replace(/&lt;/g, '<');
+    t = t.replace(/&gt;/g, '>');
+    t = t.replace(/&quot;/g, '"');
+    t = t.replace(/&#39;/g, "'");
+    t = t.replace(/[ \t]+\n/g, '\\n');
+    t = t.replace(/\n{3,}/g, '\\n\\n');
+    t = t.trim();
     return t;
   }
 
-  // word meanings inline (bold keys)
   function renderWordMeaningsInline(text) {
     var container = document.createElement('div');
     container.className = 'wm-inline';
@@ -153,26 +140,12 @@ var GitaWidget = (function () {
   // citations
   var CITE_TEXT_RE = /(?:\[\s*)?(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})(?:\s*\])?/g;
 
-  function extractCitationsFromText(text) {
-    var s = (text || '').toString();
-    var out = {}; var list = [];
-    var m;
-    while ((m = CITE_TEXT_RE.exec(s))) {
-      var ch = +m[1], v = +m[2];
-      if (ch>=1 && ch<=18 && v>=1 && v<=200) {
-        var key = ch + ':' + v;
-        if (!out[key]) { out[key]=1; list.push(key); }
-      }
-    }
-    return list;
-  }
-
   function normalizeCitations(raw) {
     var out = {}; var list = [];
     (raw || []).forEach(function (c) {
       var s = c;
       if (Object.prototype.toString.call(c) === '[object Array]') {
-        if (c.length === 2 && Number.isFinite(+c[0]) && Number.isFinite(+c[1])) s = c[0] + ':' + c[1];
+        if (c.length === 2 && !isNaN(+c[0]) && !isNaN(+c[1])) s = c[0] + ':' + c[1];
         else s = c.join(':');
       } else if (c && typeof c === 'object') {
         var ch = c.chapter || c.ch || c.c || c[0];
@@ -200,14 +173,7 @@ var GitaWidget = (function () {
       var btn = el('button', {
         class: 'citation-pill',
         title: 'Explain ' + label,
-        style: {
-          borderRadius: '999px',
-          padding: '2px 8px',
-          border: '1px solid var(--c-border)',
-          cursor: 'pointer',
-          background: 'var(--c-pill-bg)',
-          color: 'var(--c-pill-fg)'
-        }
+        style: { borderRadius: '999px', padding: '2px 8px', cursor: 'pointer' }
       }, label);
       btn.addEventListener('click', function () { if (onExplain) onExplain(ch, v); });
       wrap.appendChild(btn);
@@ -215,22 +181,19 @@ var GitaWidget = (function () {
     return wrap;
   }
 
-  // ---- NL parsing ----
+  // ========= NL parsing =========
   function stripAccents(s) {
-    try { return s.normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+    try { return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
     catch(_) { return s; }
   }
 
   function detectVerse(raw) {
     var q = ' ' + stripAccents(String(raw).toLowerCase()) + ' ';
-    // 1) generic 2.10 / 2:10 / 2-10 / 2 10
     var m = /(^|\D)(\d{1,2})\s*[:.\-\s]\s*(\d{1,3})(\D|$)/.exec(q);
     if (m) return {ch:+m[2], v:+m[3]};
-    // 2) chapter X verse Y
     m = /chapter\s*(\d{1,2})\D+verse\s*(\d{1,3})/.exec(q);
     if (m) return {ch:+m[1], v:+m[2]};
-    // 3) ch X v Y
-    m = /ch(?:apter)?\s*(\d{1,2})\D+v(?:erse)?\s*(\d{1,3})/.exec(q);
+    m = /\bch(?:apter)?\s*(\d{1,2})\D+v(?:erse)?\s*(\d{1,3})/.exec(q);
     if (m) return {ch:+m[1], v:+m[2]};
     return null;
   }
@@ -238,13 +201,13 @@ var GitaWidget = (function () {
   function buildSynonymIndex() {
     var idx = [];
     for (var key in FIELD_SYNONYMS) {
+      if (!Object.prototype.hasOwnProperty.call(FIELD_SYNONYMS, key)) continue;
       var arr = FIELD_SYNONYMS[key] || [];
       for (var i=0;i<arr.length;i++) {
         var syn = stripAccents(String(arr[i]).toLowerCase());
         idx.push({ syn: syn, field: key });
       }
     }
-    // sort longer synonyms first to avoid partial matches ("word meaning" before "word")
     idx.sort(function (a,b) { return b.syn.length - a.syn.length; });
     return idx;
   }
@@ -252,7 +215,6 @@ var GitaWidget = (function () {
 
   function detectFields(raw) {
     var q = ' ' + stripAccents(String(raw).toLowerCase()) + ' ';
-    // Normalize " and " / "&"
     q = q.replace(/\s*&\s*/g, ' and ');
     var picked = []; var seen = {};
     for (var i=0;i<SYNS.length;i++) {
@@ -270,68 +232,18 @@ var GitaWidget = (function () {
     return picked;
   }
 
-  // ---- UI mounting (kept minimal; styles similar to your earlier working look) ----
+  // ========= Core widget =========
   function mount(opts) {
     opts = opts || {};
-    var root = opts.root;
-    var apiBase = (typeof opts.apiBase === 'string') ? opts.apiBase : '';
-    var host = (typeof root === 'string') ? document.querySelector(root) : root;
+    var host = (typeof opts.root === 'string') ? document.querySelector(opts.root) : opts.root;
     if (!host) throw new Error('Root element not found');
+    var apiBase = (typeof opts.apiBase === 'string') ? opts.apiBase : '';
 
-    var dark = prefersDark();
-    var vars = {
-      '--c-bg': dark ? '#0f1115' : '#ffffff',
-      '--c-panel': dark ? '#141820' : '#f9fafb',
-      '--c-border': dark ? '#2a2f3a' : '#e5e7eb',
-      '--c-fg': dark ? '#e5e7eb' : '#111827',
-      '--c-muted': dark ? '#a3aab8' : '#6b7280',
-      '--c-pill-bg': dark ? '#1f2530' : '#f3f4f6',
-      '--c-pill-fg': dark ? '#e5e7eb' : '#1f2937',
-      '--c-accent': '#ff8d1a',
-      '--c-accent-border': '#e07a00'
-    };
-
-    var style = el('style', {}, [
-      '.gw2 *{box-sizing:border-box;}',
-      '.gw2{background:var(--c-bg);color:var(--c-fg);border:1px solid var(--c-border);border-radius:10px;padding:12px;}',
-      '.gw2 .log{display:flex;flex-direction:column;gap:12px;min-height:38vh;max-height:65vh;overflow:auto;padding:8px;background:var(--c-panel);border:1px solid var(--c-border);border-radius:8px;}',
-      '.gw2 .msg{display:block;white-space:pre-wrap;}',
-      '.gw2 .msg .bubble{width:100%;padding:0;}',
-      '.gw2 .msg.user .bubble{background:var(--c-bg);border:1px solid var(--c-border);padding:10px 12px;border-radius:8px;}',
-      '.gw2 .row{display:flex;gap:8px;align-items:center;margin-top:10px;}',
-      '.gw2 input[type="text"]{flex:1;padding:14px;border:1px solid var(--c-border);border-radius:10px;background:transparent;color:var(--c-fg);font-size:18px;}',
-      '.gw2 .clear{padding:10px 12px;border:1px solid var(--c-border);background:transparent;border-radius:8px;cursor:pointer;color:var(--c-fg);}',
-      '.gw2 .send{width:42px;height:42px;border-radius:999px;border:2px solid var(--c-accent-border);background:var(--c-accent);color:#fff;cursor:pointer;display:grid;place-items:center;line-height:1;position:relative;}',
-      '.gw2 .send .arrow{font-size:22px;font-weight:900;transform:scaleX(1.1) scaleY(0.6);}',
-      '.gw2 .send.loading .arrow{visibility:hidden;}',
-      '.gw2 .send.loading::after{content:"";width:16px;height:16px;border-radius:50%;border:2px solid rgba(255,255,255,0.6);border-top-color:rgba(255,255,255,1);position:absolute;inset:0;margin:auto;animation:gw2spin .9s linear infinite;}',
-      '@keyframes gw2spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}',
-      '.gw2 .pillbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}',
-      '.gw2 .citations{margin:6px 0 6px;}',
-      '.gw2 .sect{margin-top:14px;}',
-      '.gw2 .sect.title{font-weight:800;}',
-      '.gw2 .sect.transl{font-style:italic;}',
-      '.gw2 .wm-inline{margin-top:12px;}',
-      '.gw2 .wm-key{font-weight:800;}'
-    ].join(''));
-
-    var wrap = el('div', { class: 'gw2' });
-    for (var vk in vars) { try { wrap.style.setProperty(vk, vars[vk]); } catch(_){} }
-    wrap.appendChild(style);
-
-    var log = el('div', { class: 'log', role: 'log', 'aria-live': 'polite' });
-    var input = el('input', { type: 'text', placeholder: 'Ask about the Gita… (e.g., 2.10 Sanskrit; Shankara for 2.10; 2.10 English and Meaning)', autocomplete: 'off' });
-    var clearBtn = el('button', { class: 'clear', title: 'Clear conversation' }, 'Clear');
-    var sendBtn = el('button', { class: 'send', title: 'Send' }, el('span', { class: 'arrow' }, '↑'));
-    var row = el('div', { class: 'row' }, input, clearBtn, sendBtn);
-    var pillbar = el('div', { class: 'pillbar' });
-
-    wrap.appendChild(log);
-    wrap.appendChild(row);
-    wrap.appendChild(pillbar);
-
-    if (host.firstChild) host.innerHTML = '';
-    host.appendChild(wrap);
+    var log = el('div', { class: 'log' });
+    var input = el('input', { type: 'text', placeholder: 'Ask… e.g., 2.10 Sanskrit; Shankara for 2:10; 2.10 English and Meaning', style: { width:'100%', padding:'12px', borderRadius:'8px', border:'1px solid #444' } });
+    var clearBtn = el('button', { type:'button' }, 'Clear');
+    var sendBtn = el('button', { type:'button' }, 'Send');
+    var form = el('div', { class: 'row', style:{ display:'flex', gap:'8px', marginTop:'10px' } }, input, clearBtn, sendBtn);
 
     function autoScroll() { log.scrollTop = log.scrollHeight; }
 
@@ -340,57 +252,44 @@ var GitaWidget = (function () {
       var msg = el('div', { class: 'msg ' + role });
       var bubble = el('div', { class: 'bubble' });
 
-      // Citations (normalized)
       var citeArr = normalizeCitations(extras.citations || []);
-      var citeSet = {}; var citesList = [];
-      for (var i=0;i<citeArr.length;i++) { var cvv=citeArr[i]; if (!citeSet[cvv]) { citeSet[cvv]=1; citesList.push(cvv); } }
-
       if (role === 'user') {
         bubble.textContent = content;
       } else {
-        if (content && typeof content === 'object') {
-          // When we render field-specific results, we pass a synthetic "render" array
-          if (content.__render && Object.prototype.toString.call(content.__render)==='[object Array]') {
-            var blocks = content.__render;
-            for (var bi=0; bi<blocks.length; bi++) {
-              var block = blocks[bi];
-              var key = block.key, text = block.text;
-              if (!text) continue;
-              if (key === 'title') {
-                bubble.appendChild(el('div', { class: 'sect title' }, toPlain(text)));
-              } else if (key === 'word_meanings') {
-                bubble.appendChild(renderWordMeaningsInline(text));
-              } else if (key === 'translation') {
-                bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(text)));
-              } else {
-                // For multiple fields, show labels
-                if (blocks.length > 1 && FIELD_LABEL[key]) {
-                  bubble.appendChild(el('div', { class: 'sect title' }, FIELD_LABEL[key]));
-                }
-                bubble.appendChild(el('div', { class: 'sect' }, toPlain(text)));
+        if (content && typeof content === 'object' && content.__render) {
+          var blocks = content.__render;
+          for (var bi=0; bi<blocks.length; bi++) {
+            var block = blocks[bi];
+            if (block.key === 'title') {
+              bubble.appendChild(el('div', {}, toPlain(block.text)));
+            } else if (block.key === 'word_meanings') {
+              bubble.appendChild(renderWordMeaningsInline(block.text));
+            } else if (block.key === 'translation') {
+              bubble.appendChild(el('div', {}, toPlain(block.text)));
+            } else {
+              if (blocks.length > 1 && FIELD_LABEL[block.key]) {
+                bubble.appendChild(el('div', { style:{ fontWeight:'800', marginTop:'8px' } }, FIELD_LABEL[block.key]));
               }
+              bubble.appendChild(el('div', {}, toPlain(block.text)));
             }
-          } else {
-            // default render (existing object)
-            var any = false;
-            if (content.title)       { any = true; bubble.appendChild(el('div', { class: 'sect title' }, toPlain(content.title))); }
-            if (content.sanskrit)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.sanskrit))); }
-            if (content.roman)       { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
-            if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
-            if (content.word_meanings){ any = true; bubble.appendChild(renderWordMeaningsInline(content.word_meanings)); }
-            if (content.summary)     { any = true; bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + toPlain(content.summary))); }
-            if (!any && content.answer) bubble.appendChild(el('div', {}, toPlain(content.answer)));
-            if (!any && !content.answer) bubble.textContent = toPlain(JSON.stringify(content));
           }
+        } else if (content && typeof content === 'object') {
+          var any = false;
+          if (content.title)       { any = true; bubble.appendChild(el('div', {}, toPlain(content.title))); }
+          if (content.sanskrit)    { any = true; bubble.appendChild(el('div', {}, toPlain(content.sanskrit))); }
+          if (content.roman)       { any = true; bubble.appendChild(el('div', {}, toPlain(content.roman))); }
+          if (content.translation) { any = true; bubble.appendChild(el('div', {}, toPlain(content.translation))); }
+          if (content.word_meanings){ any = true; bubble.appendChild(renderWordMeaningsInline(content.word_meanings)); }
+          if (content.summary)     { any = true; bubble.appendChild(el('div', {}, 'Summary: ' + toPlain(content.summary))); }
+          if (!any && content.answer) bubble.appendChild(el('div', {}, toPlain(content.answer)));
+          if (!any && !content.answer) bubble.textContent = toPlain(JSON.stringify(content));
         } else {
           bubble.textContent = toPlain(content);
         }
       }
 
-      if (citesList.length && role === 'bot' && extras.onExplain) {
-        var pills = renderCitations(citesList, extras.onExplain);
-        if (pills) msg.appendChild(pills);
-      }
+      var pills = renderCitations(citeArr, function(ch, v) { doAsk('Explain ' + ch + '.' + v); });
+      if (pills) msg.appendChild(pills);
 
       msg.appendChild(bubble);
       log.appendChild(msg);
@@ -398,7 +297,6 @@ var GitaWidget = (function () {
     }
 
     function verseExists(ch, v) {
-      // Basic guard: Gita has 18 chapters; verses per chapter vary; we only hard-block obvious impossibles
       if (!(ch>=1 && ch<=18)) return false;
       if (!(v>=1 && v<=200)) return false;
       return true;
@@ -406,26 +304,19 @@ var GitaWidget = (function () {
 
     function doAskRaw(q) {
       pushMessage('user', q);
-      sendBtn.classList.add('loading');
       return fetchJSON(apiBase + '/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q, topic: 'gita' })
       }).then(function (res) {
         var citations = Array.isArray(res.citations) ? res.citations : [];
-        pushMessage('bot', (res.answer != null ? res.answer : res), {
-          citations: citations,
-          onExplain: function (ch, v) { doAsk('Explain ' + ch + '.' + v); }
-        });
+        pushMessage('bot', (res.answer != null ? res.answer : res), { citations: citations });
       }).catch(function (e) {
         pushMessage('bot', 'Error: ' + (e && e.message ? e.message : String(e)));
-      }).finally(function () {
-        sendBtn.classList.remove('loading');
       });
     }
 
     function doAsk(q) {
-      // Natural-language field/verse detection
       var cv = detectVerse(q);
       var fields = detectFields(q);
 
@@ -435,11 +326,8 @@ var GitaWidget = (function () {
         return;
       }
 
-      // If we have a verse and at least one field, fetch Explain CV and render only requested fields.
       if (cv && fields.length) {
         pushMessage('user', q);
-        sendBtn.classList.add('loading');
-        // Always fetch the canonical Explain, then filter client-side
         return fetchJSON(apiBase + '/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -447,51 +335,37 @@ var GitaWidget = (function () {
         }).then(function (res) {
           var obj = (res && (res.answer != null ? res.answer : res)) || {};
           var blocks = [];
-          // Title first (if present)
           if (obj && obj.title) blocks.push({ key:'title', text: obj.title });
 
-          // Expand "all_commentaries" already handled in detectFields, so just walk requested canonical keys
           var wanted = [];
           for (var i=0;i<fields.length;i++) {
             var f = fields[i];
-            if (f === 'all_commentaries') continue; // already expanded earlier
+            if (f === 'all_commentaries') continue;
             wanted.push(f);
           }
-          // Deduplicate while preserving order
           var seen = {}; var ordered = [];
           for (var i2=0;i2<wanted.length;i2++) { var w=wanted[i2]; if (!seen[w]) { seen[w]=1; ordered.push(w); } }
 
-          // Pull each field from the object
           for (var j=0;j<ordered.length;j++) {
             var key = ordered[j];
             var val = obj ? (obj[key] || '') : '';
-            if (!val && key==='roman' && obj && obj.transliteration) val = obj.transliteration; // safety alias
+            if (!val && key==='roman' && obj && obj.transliteration) val = obj.transliteration;
             if (!val) continue;
             blocks.push({ key:key, text: val });
           }
 
-          // If "commentary" generic requested but fields absent, say so
-          if (!blocks.length && fields.length) {
-            blocks.push({ key:'title', text: 'No requested fields found for ' + cv.ch + '.' + cv.v });
-          }
-
           var citations = Array.isArray(res.citations) ? res.citations : [];
-          pushMessage('bot', { __render: blocks }, {
-            citations: citations,
-            onExplain: function (ch, v) { doAsk('Explain ' + ch + '.' + v); }
-          });
+          if (!blocks.length && fields.length) blocks.push({ key:'title', text: 'No requested fields found for ' + cv.ch + '.' + cv.v });
+
+          pushMessage('bot', { __render: blocks }, { citations: citations });
         }).catch(function (e) {
           pushMessage('bot', 'Error: ' + (e && e.message ? e.message : String(e)));
-        }).finally(function () {
-          sendBtn.classList.remove('loading');
         });
       }
 
-      // Otherwise just do the normal ask (Explain C.V or term search)
       return doAskRaw(q);
     }
 
-    // wire controls
     sendBtn.addEventListener('click', function () {
       var q = (input.value || '').trim();
       if (!q) return;
@@ -507,10 +381,17 @@ var GitaWidget = (function () {
       input.focus();
     });
 
+    // Mount
+    var container = el('div', {});
+    container.appendChild(log);
+    container.appendChild(form);
+    host.innerHTML = '';
+    host.appendChild(container);
+
     return { ask: doAsk };
   }
 
-  return { mount: mount };
-})();
+  var api = { mount: mount };
+  if (typeof global !== 'undefined') global.GitaWidget = api;
 
-if (typeof window !== 'undefined') window.GitaWidget = GitaWidget;
+})(typeof window !== 'undefined' ? window : this);
