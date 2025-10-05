@@ -1,22 +1,25 @@
 // Gita Q&A v2 — CLEAN FIX (no duplicate vars) 
-// Version: v2.6.1-clean (closure fix for citation clicks)
-// - Fix: citation button listeners now capture ch/v correctly (no null m).
-// - All other behavior same as v2.6-clean.
+// Version: v2.7 field-queries + suppressCv + title nocites
+// - Natural-language field queries (Sanskrit / English(=roman) / Translation / Word meanings / Commentary).
+// - Title-first layout for field queries, same as Explain.
+// - Suppress redundant top citation pill for the same verse (extras.suppressCv).
+// - Do not turn the title's "2:47" into a clickable pill.
+// - Strip literal "[C:V]" tokens from summary.
+// - No visual UI changes.
 
 const GitaWidget = (() => {
-  console.log('[GW] init v2.6.1-clean');
+  console.log('[GW] init v2.7');
 
-  // === FIELD QUERY ADDON (no UI changes) ===================================
-  // Edit synonyms here to control natural-language mapping.
+  // ===== Field query addon (no UI changes) =====
   const FIELD_SYNONYMS = {
     sanskrit:        ["sanskrit"],
-    roman:           ["transliteration","roman","english"], // "English" → transliteration
+    roman:           ["transliteration","roman","english"], // "English" => roman
     colloquial:      ["colloquial","simple"],
     translation:     ["translation","meaning","rendering"],
-    word_meanings:   ["word meaning","word meanings","word-by-word","word by word","padartha"],
+    word_meanings:   ["word meaning","word meanings","word-by-word","word by word","padartha","padārtha"],
     commentary1:     ["shankara","śaṅkara","shankaracharya","commentary 1","commentary1"],
     commentary2:     ["commentary 2","commentary2","modern commentary"],
-    all_commentaries:["commentary","all commentary","all commentaries"] // expands to 1+2
+    all_commentaries:["commentary","all commentary","all commentaries","full commentary","both commentaries","complete commentary"]
   };
 
   function stripAccents(s){ try{ return s.normalize('NFD').replace(/[\u0300-\u036f]/g,''); }catch(_){ return s; } }
@@ -31,6 +34,7 @@ const GitaWidget = (() => {
     if (m) return { ch:+m[1], v:+m[2] };
     return null;
   }
+  function verseLooksPossible(ch,v){ return ch>=1 && ch<=18 && v>=1 && v<=200; }
 
   function buildSynonymIndex() {
     const idx = [];
@@ -39,7 +43,6 @@ const GitaWidget = (() => {
         idx.push({ syn: stripAccents(String(syn).toLowerCase()), field: key });
       });
     }
-    // match longer phrases first (e.g., "word meaning" before "word")
     idx.sort((a,b)=> b.syn.length - a.syn.length);
     return idx;
   }
@@ -52,18 +55,28 @@ const GitaWidget = (() => {
     for (const {syn, field} of __SYNS){
       if (q.indexOf(' '+syn+' ') !== -1) {
         if (field === 'all_commentaries') {
-          if (!seen.commentary1) { seen.commentary1 = 1; picked.push('commentary1'); }
-          if (!seen.commentary2) { seen.commentary2 = 1; picked.push('commentary2'); }
+          if (!seen.commentary1){ seen.commentary1=1; picked.push('commentary1'); }
+          if (!seen.commentary2){ seen.commentary2=1; picked.push('commentary2'); }
         } else if (!seen[field]) {
-          seen[field] = 1; picked.push(field);
+          seen[field]=1; picked.push(field);
         }
       }
     }
     return picked;
   }
 
-  function verseLooksPossible(ch,v){ return ch>=1 && ch<=18 && v>=1 && v<=200; }
-  // ========================================================================
+  // tolerant field picker for backend name variants
+  function pickField(obj, key) {
+    if (!obj) return '';
+    const cap = key.charAt(0).toUpperCase()+key.slice(1);
+    const list = [key, key.toLowerCase(), key.toUpperCase(), cap];
+    if (key === 'roman') list.push('transliteration','Transliteration');
+    if (key === 'commentary1') list.push('Commentary1','Shankara','śaṅkara','Śaṅkara');
+    if (key === 'commentary2') list.push('Commentary2');
+    for (const k of list) if (k in obj && String(obj[k]||'').trim()) return obj[k];
+    return '';
+  }
+  // =============================================
 
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
@@ -280,16 +293,20 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
-      const citeSet = new Set(normalizeCitations(extras.citations));
+      // build citation set
+      let citeSet = new Set(normalizeCitations(extras.citations));
       if (role === 'bot' && content && typeof content === 'object') {
-        ['answer','summary','title','translation','word_meanings'].forEach(k => {
+        ['answer','summary','title','translation','word_meanings','commentary1','commentary2'].forEach(k => {
           if (content[k]) extractCitationsFromText(content[k]).forEach(cv => citeSet.add(cv));
         });
       } else if (role === 'bot' && typeof content === 'string') {
         extractCitationsFromText(content).forEach(cv => citeSet.add(cv));
       }
 
-      const cites = [...citeSet];
+      // suppress a specific citation (to avoid the redundant top pill)
+      let cites = [...citeSet];
+      if (extras.suppressCv) cites = cites.filter(cv => cv !== extras.suppressCv);
+
       if (cites.length) {
         const pills = renderCitations(cites, (ch, v) => doAsk(`Explain ${ch}.${v}`));
         if (pills) msg.appendChild(pills);
@@ -301,9 +318,14 @@ const GitaWidget = (() => {
         if (content && typeof content === 'object') {
           let any = false;
 
+          // Title (mark as nocites so we don't inline-link "2:47" here)
           let rawTitle = toPlain(content.title || '');
           if (/^\s*word\s*meaning\b/i.test(rawTitle)) rawTitle = '';
-          if (rawTitle) { any = true; bubble.appendChild(el('div', { class: 'sect title' }, rawTitle)); }
+          if (rawTitle) {
+            any = true;
+            const t = el('div', { class: 'sect title', 'data-nocites': '1' }, rawTitle);
+            bubble.appendChild(t);
+          }
 
           if (content.sanskrit)    { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.sanskrit))); }
           if (content.roman)       { any = true; bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.roman))); }
@@ -314,7 +336,23 @@ const GitaWidget = (() => {
             bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
           }
 
-          if (content.summary)     { any = true; bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + toPlain(content.summary))); }
+          // Commentary sections (when present)
+          if (content.commentary1) {
+            any = true;
+            bubble.appendChild(el('div', { class: 'sect' }, 'Śaṅkara (Commentary 1):'));
+            bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.commentary1)));
+          }
+          if (content.commentary2) {
+            any = true;
+            bubble.appendChild(el('div', { class: 'sect' }, 'Commentary 2:'));
+            bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.commentary2)));
+          }
+
+          if (content.summary) {
+            any = true;
+            const cleanedSummary = toPlain(String(content.summary).replace(/\[C:V\]/g,''));
+            bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + cleanedSummary));
+          }
 
           const rest = content.answer;
           if (!any && rest) bubble.appendChild(el('div', {}, toPlain(rest)));
@@ -324,6 +362,7 @@ const GitaWidget = (() => {
         }
       }
 
+      // Inline citations—but skip inside the title block
       enhanceInlineCitations(bubble, (ch, v) => doAsk(`Explain ${ch}.${v}`));
 
       msg.appendChild(bubble);
@@ -343,7 +382,11 @@ const GitaWidget = (() => {
       const RE = CITE_TEXT_RE;
       const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, null);
       const targets = [];
-      for (let n = walker.nextNode(); n; n = walker.nextNode()) targets.push(n);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        // skip inside title block
+        if (n.parentElement && n.parentElement.closest('.sect.title')) continue;
+        targets.push(n);
+      }
       targets.forEach(node => {
         const text = node.nodeValue;
         if (!RE.test(text)) return;
@@ -384,12 +427,11 @@ const GitaWidget = (() => {
     }
 
     async function doAsk(q) {
-      // === FIELD-QUERY INTERCEPT (no UI changes) ============================
+      // ---- Field-query intercept ----
       try {
         const cv = detectVerse(q);
         const fields = detectFields(q);
         if (cv && !verseLooksPossible(cv.ch, cv.v)) {
-          // show user + friendly error
           pushMessage('user', q);
           pushMessage('bot', `Chapter ${cv.ch}, Verse ${cv.v} does not exist.`);
           return;
@@ -404,36 +446,22 @@ const GitaWidget = (() => {
               body: JSON.stringify({ question: `Explain ${cv.ch}.${cv.v}`, topic: 'gita' })
             });
             const obj = (res && (res.answer ?? res)) || {};
-            const lines = [];
-            if (obj.title) lines.push(String(obj.title).trim());
+            const out = { title: String(obj.title||'').trim() };
 
-            // Expand/dedup
             const want = []; const seen = {};
-            for (const f of fields) {
-              if (f === 'all_commentaries') continue; // already expanded in detectFields
-              if (!seen[f]) { seen[f] = 1; want.push(f); }
-            }
+            for (const f of fields) { if (!seen[f]) { seen[f]=1; want.push(f); } }
 
             for (const key of want) {
-              let val = obj[key] || '';
-              if (!val && key === 'roman' && obj.transliteration) val = obj.transliteration;
+              const val = pickField(obj, key);
               if (!val) continue;
-              if (key === 'commentary1') {
-                lines.push('Śaṅkara (Commentary 1):');
-                lines.push(toPlain(val));
-                lines.push('');
-              } else if (key === 'commentary2') {
-                lines.push('Commentary 2:');
-                lines.push(toPlain(val));
-                lines.push('');
-              } else {
-                lines.push(toPlain(val));
-              }
+              if (key === 'commentary1') out.commentary1 = val;
+              else if (key === 'commentary2') out.commentary2 = val;
+              else out[key] = val;
             }
 
-            if (!lines.length) lines.push(`No requested fields found for ${cv.ch}.${cv.v}.`);
             const citations = Array.isArray(res.citations) ? res.citations : [];
-            pushMessage('bot', lines.join('\n'), { citations, raw: res, asked: q });
+            const suppressCv = `${cv.ch}:${cv.v}`;
+            pushMessage('bot', out, { citations, raw: res, asked: q, suppressCv });
           } catch (e) {
             pushMessage('bot', 'Error: ' + (e.message || e));
           } finally {
@@ -443,11 +471,8 @@ const GitaWidget = (() => {
         }
       } catch (e) {
         console.error('[field-intercept] error', e);
-        // fall through to default flow
       }
-      // =====================================================================
-
-      // ORIGINAL FLOW (unchanged)
+      // ---- Default flow ----
       pushMessage('user', q);
       try {
         sendBtn.classList.add('loading');
@@ -457,7 +482,13 @@ const GitaWidget = (() => {
           body: JSON.stringify({ question: q, topic: 'gita' })
         });
         const citations = Array.isArray(res.citations) ? res.citations : [];
-        pushMessage('bot', res.answer ?? res, { citations, raw: res, asked: q });
+        // suppress the top pill if the main result is an Explain for a single verse
+        let suppressCv = '';
+        const a = (res && (res.answer ?? res)) || {};
+        if (a && Number.isFinite(+a.chapter) && Number.isFinite(+a.verse)) {
+          suppressCv = `${+a.chapter}:${+a.verse}`;
+        }
+        pushMessage('bot', res.answer ?? res, { citations, raw: res, asked: q, suppressCv });
       } catch (e) {
         pushMessage('bot', 'Error: ' + (e.message || e));
       } finally {
