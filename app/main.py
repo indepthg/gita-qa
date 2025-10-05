@@ -370,6 +370,45 @@ def _synthesize_from_context(question: str, ctx_lines: List[str], target_words: 
         print("LLM synth failed:", e)
         return ""
 
+def _synthesize_structured(question: str, ctx_lines: List[str], max_sections: int = 6) -> str:
+    """
+    Produce a 4–6 section, outline-style answer.
+    Format (plain text):
+      1) <Title>
+      <3–5 sentences> [2:47] [3:19]
+
+      2) <Title>
+      <3–5 sentences> [9:22]
+    """
+    ctx = "\n".join(ctx_lines)[:8000]
+    prompt = (
+        "You are a Bhagavad Gita assistant. Use ONLY the Context.\n"
+        "Write a structured answer with 4–6 thematic sections. For each section:\n"
+        "- Start with 'N) <Short Title>' on its own line (N = 1..6)\n"
+        "- Then 3–5 sentences of plain text (no bullets/markdown), grounded in Context\n"
+        "- Include verse citations inline as [2:47] style for claims\n"
+        "Constraints:\n"
+        f"- Total length ≈ 400–500 words; {max_sections} sections max\n"
+        "- No HTML/Markdown; no invented sources; if insufficient context, say so\n\n"
+        f"Question: {question}\n\n"
+        "Context (each line = [C:V] prose):\n"
+        f"{ctx}\n"
+    )
+    try:
+        rsp = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=[
+                {"role": "system", "content": "Answer ONLY from the provided context. Plain text. Use [chapter:verse] citations."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=700,  # enough for 6 short sections
+        )
+        return (rsp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("LLM synth (structured) failed:", e)
+        return ""
+
 
 # ---------- /ask ----------
 
@@ -498,7 +537,10 @@ async def ask(payload: AskPayload):
         }
 
     # LLM synthesis (~200 words), grounded in the context
-    ans = _synthesize_from_context(q, ctx_lines, target_words=200)
+    # ans = _synthesize_from_context(q, ctx_lines, target_words=200)
+    
+    # NEW (structured):
+    ans = _synthesize_structured(q, ctx_lines, max_sections=6)
 
     # Extract any [2:47]-style citations the model actually used
     model_cites = _extract_citations_from_text(ans)
