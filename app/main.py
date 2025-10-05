@@ -328,6 +328,8 @@ async def ask(payload: AskPayload):
             "translation": row["translation"] or "",
             "word_meanings": row["word_meanings"] or "",
             "capsule_url": row["capsule_url"] or "",
+            "commentary1": row["commentary1"] or "",
+            "commentary2": row["commentary2"] or "",
             "summary": summary or "",
             "neighbors": [
                 {"chapter": int(n["chapter"]), "verse": int(n["verse"]), "translation": n["translation"] or ""}
