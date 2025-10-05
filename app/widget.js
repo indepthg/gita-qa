@@ -489,6 +489,22 @@ const GitaWidget = (() => {
           suppressCv = `${+a.chapter}:${+a.verse}`;
         }
         pushMessage('bot', res.answer ?? res, { citations, raw: res, asked: q, suppressCv });
+
+        if (Array.isArray(res.suggestions) && res.suggestions.length) {
+          const bar = document.createElement('div');
+          bar.className = 'pillbar';
+          res.suggestions.forEach(txt => {
+            const b = document.createElement('button');
+            b.className = 'pill';
+            b.textContent = txt;
+            b.addEventListener('click', () => doAsk(txt));
+            bar.appendChild(b);
+          });
+          // append just below the last bot message
+          const msgs = document.querySelectorAll('.gw2 .msg.bot');
+          if (msgs.length) msgs[msgs.length-1].appendChild(bar);
+        }
+
       } catch (e) {
         pushMessage('bot', 'Error: ' + (e.message || e));
       } finally {
