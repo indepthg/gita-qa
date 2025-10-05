@@ -1,7 +1,8 @@
-# main.py — Gita Q&A v2 (RAG-enabled broad answers)
+# main.py — Gita Q&A v2 (RAG with diversified retrieval + structured synthesis)
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,12 +67,11 @@ init_db()
 
 RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
 
-
 class AskPayload(BaseModel):
     question: str
     topic: Optional[str] = None
 
-
+# ---------- Home (unchanged UI) ----------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -166,9 +166,7 @@ def home():
 </html>
     """
 
-
 # ---------- Ingest endpoints ----------
-
 @app.post("/ingest_sheet_sql")
 async def ingest_sheet_sql(file: UploadFile = File(...)):
     try:
@@ -180,7 +178,6 @@ async def ingest_sheet_sql(file: UploadFile = File(...)):
         return {"ingested_rows": n}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.post("/ingest_commentary")
 async def ingest_commentary_route(
@@ -196,9 +193,7 @@ async def ingest_commentary_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
 # ---------- Lookup & debug ----------
-
 @app.get("/title/{ch}/{v}")
 async def get_title(ch: int, v: int):
     conn = get_conn()
@@ -206,7 +201,6 @@ async def get_title(ch: int, v: int):
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
     return {"chapter": ch, "verse": v, "title": row["title"] or ""}
-
 
 @app.get("/debug/verse/{ch}/{v}")
 async def debug_verse(ch: int, v: int):
@@ -216,12 +210,10 @@ async def debug_verse(ch: int, v: int):
         raise HTTPException(status_code=404, detail="Not found")
     return dict(row)
 
-
 @app.get("/debug/stats")
 async def debug_stats():
     conn = get_conn()
     return stats(conn)
-
 
 @app.get("/suggest")
 async def suggest():
@@ -235,8 +227,9 @@ async def suggest():
         ]
     }
 
-
 # ---------- Helpers ----------
+RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
+CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
 
 def _extract_ch_verse(text: str) -> Optional[Tuple[int, int]]:
     m = RE_CV.search(text or "")
@@ -244,11 +237,9 @@ def _extract_ch_verse(text: str) -> Optional[Tuple[int, int]]:
         return None
     return int(m.group(1)), int(m.group(2))
 
-
 def _is_word_meaning_query(q: str) -> bool:
     ql = (q or "").lower()
     return ("word meaning" in ql) or ("meaning" in ql and RE_CV.search(ql) is not None)
-
 
 def _summarize(prompt: str) -> str:
     """Light-weight short summary helper used for verse-specific 'Explain'."""
@@ -265,35 +256,6 @@ def _summarize(prompt: str) -> str:
         return (rsp.choices[0].message.content or "").strip()
     except Exception:
         return ""
-
-
-def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int, int, Dict]]:
-    results: List[Tuple[int, int, Dict]] = []
-    seen = set()
-    for r in fts_rows:
-        key = (int(r["chapter"]), int(r["verse"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append((key[0], key[1], dict(r)))
-    if embed_hits and embed_hits.get("metadatas"):
-        for metas in embed_hits["metadatas"]:
-            for m in metas:
-                ch = int(m.get("chapter") or 0)
-                v = int(m.get("verse") or 0)
-                if ch <= 0 or v <= 0:
-                    continue
-                key = (ch, v)
-                if key in seen:
-                    continue
-                seen.add(key)
-                results.append((ch, v, m))
-    return results[:12]
-
-
-# --- New helpers for RAG thematic answers ---
-
-CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
 
 def _clean_text(t: str) -> str:
     if not t:
@@ -339,59 +301,112 @@ def _make_dynamic_suggestions(user_q: str, cites: List[str]) -> List[str]:
         sug.append("Practical takeaway")
     return sug[:4]
 
-def _synthesize_from_context(question: str, ctx_lines: List[str], target_words: int = 200) -> str:
-    """
-    Uses your OpenAI client; precise prompt keeps output grounded, plain-text,
-    ~N words, with [2:47]-style citations.
-    """
-    ctx = "\n".join(ctx_lines)[:8000]  # safety cap
-    prompt = (
-        "You are a Bhagavad Gita assistant. Use ONLY the Context below.\n"
-        "Write a cohesive plain-text answer (~{tw} words). No HTML/Markdown.\n"
-        "Every verse you draw from must be cited inline exactly like [2:47].\n"
-        "If the Context is insufficient, say what is missing.\n\n"
-        f"Question: {question}\n\n"
-        "Context (each line = verse and prose snippet):\n"
-        f"{ctx}\n"
-    ).format(tw=target_words)
+# --- Light semantic expansion for common themes (improves retrieval recall) ---
+THEME_EXPAND = {
+    "anger": ["anger", "krodha", "wrath", "rage", "ire"],
+    "desire": ["desire", "kama", "craving", "longing"],
+    "self": ["Self", "Atman", "Purusha", "Kshetrajna"],
+    "devotion": ["devotion", "bhakti", "worship", "surrender"],
+    "meditation": ["meditation", "dhyana", "concentration", "mind control"],
+    "detachment": ["detachment", "vairagya", "equanimity", "non-attachment"],
+}
 
-    try:
-        rsp = client.chat.completions.create(
-            model=GEN_MODEL,
-            messages=[
-                {"role": "system", "content": "Answer grounded in the provided context only. Plain text. Cite verses as [2:47]."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=450,  # ~200 words
-        )
-        return (rsp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print("LLM synth failed:", e)
-        return ""
+def _expand_query(q: str) -> str:
+    ql = (q or "").lower()
+    terms: List[str] = []
+    for key, syns in THEME_EXPAND.items():
+        if key in ql:
+            terms.extend(syns)
+    if not terms:
+        return q
+    # join with OR to help FTS find any synonym
+    q2 = q + " OR " + " OR ".join(dict.fromkeys(terms))
+    return q2
 
-def _synthesize_structured(question: str, ctx_lines: List[str], max_sections: int = 6) -> str:
+# --- Retrieval diversification ---
+def _diversify_hits(merged: List[Tuple[int, int, Dict]],
+                    per_chapter: int = 2,
+                    max_total: int = 10,
+                    neighbor_radius: int = 1,
+                    min_distinct_chapters: int = 3) -> List[Tuple[int, int, Dict]]:
     """
-    Produce a 4–6 section, outline-style answer.
-    Format (plain text):
-      1) <Title>
-      <3–5 sentences> [2:47] [3:19]
+    Greedy diversification:
+      - Keep input order (bm25 relevance) from search_fts.
+      - Cap per-chapter picks.
+      - Suppress near neighbors (same chapter within ±neighbor_radius).
+      - Try to ensure min chapter diversity when possible.
+    """
+    selected: List[Tuple[int, int, Dict]] = []
+    per_ch = defaultdict(int)
 
-      2) <Title>
-      <3–5 sentences> [9:22]
+    def is_neighbor(ch: int, v: int) -> bool:
+        for (sch, sv, _) in selected:
+            if ch == sch and abs(v - sv) <= neighbor_radius:
+                return True
+        return False
+
+    # First pass: respect per-chapter cap & neighbor suppression
+    for ch, v, data in merged:
+        if len(selected) >= max_total:
+            break
+        if per_ch[ch] >= per_chapter:
+            continue
+        if is_neighbor(ch, v):
+            continue
+        selected.append((ch, v, data))
+        per_ch[ch] += 1
+
+    # If too few or low diversity, relax neighbor suppression a bit and fill
+    if len({ch for ch, _, _ in selected}) < min_distinct_chapters:
+        for ch, v, data in merged:
+            if len(selected) >= max_total:
+                break
+            if per_ch[ch] >= per_chapter:
+                continue
+            # allow neighbor now, but still avoid exact duplicates
+            if any((ch == sch and v == sv) for sch, sv, _ in selected):
+                continue
+            selected.append((ch, v, data))
+            per_ch[ch] += 1
+
+    return selected[:max_total]
+
+# --- Structured synthesis (3–5 sections; 400–500 words) ---
+def _synthesize_structured(question: str, ctx_lines: List[str],
+                           min_sections: int = 3,
+                           max_sections: int = 5,
+                           target_words_low: int = 400,
+                           target_words_high: int = 500,
+                           enforce_diversity_hint: Optional[List[str]] = None) -> str:
+    """
+    Output format (plain text):
+      1) <Short Title>
+      <2–4 sentences> [2:47] [3:19]
+
+      2) <Short Title>
+      <2–4 sentences> [9:22]
     """
     ctx = "\n".join(ctx_lines)[:8000]
+    diversity_hint = ""
+    if enforce_diversity_hint:
+        diversity_hint = (
+            "Broaden citations across chapters where possible; avoid clustering from adjacent verses. "
+            f"Prefer using at least these distinct chapters if relevant: {', '.join(sorted(set(enforce_diversity_hint)))}.\n"
+        )
     prompt = (
-        "You are a Bhagavad Gita assistant. Use ONLY the Context.\n"
-        "Write a structured answer with 4–6 thematic sections. For each section:\n"
-        "- Start with 'N) <Short Title>' on its own line (N = 1..6)\n"
-        "- Then 3–5 sentences of plain text (no bullets/markdown), grounded in Context\n"
-        "- Include verse citations inline as [2:47] style for claims\n"
-        "Constraints:\n"
-        f"- Total length ≈ 400–500 words; {max_sections} sections max\n"
-        "- No HTML/Markdown; no invented sources; if insufficient context, say so\n\n"
+        "You are a Bhagavad Gita assistant. Use ONLY the Context below.\n"
+        f"Write a structured answer with {min_sections}–{max_sections} thematic sections. For each section:\n"
+        "- Start with 'N) <Short Title>' on its own line (N = 1..5)\n"
+        "- Then 2–4 sentences of plain text (no bullets/markdown), grounded in Context\n"
+        "- Include verse citations inline as [chapter:verse] at the end of the sentences that use them\n"
+        "Global constraints:\n"
+        f"- Total length ≈ {target_words_low}–{target_words_high} words\n"
+        "- Use ONLY context; if insufficient, say what's missing\n"
+        "- Use at least 3 distinct verses overall and aim for at least 3 distinct chapters if the Context allows\n"
+        "- Do not invent sources or verses\n"
+        f"{diversity_hint}\n"
         f"Question: {question}\n\n"
-        "Context (each line = [C:V] prose):\n"
+        "Context (each line = [chapter:verse] prose):\n"
         f"{ctx}\n"
     )
     try:
@@ -402,16 +417,14 @@ def _synthesize_structured(question: str, ctx_lines: List[str], max_sections: in
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=700,  # enough for 6 short sections
+            max_tokens=900,  # accommodates ~500 words
         )
         return (rsp.choices[0].message.content or "").strip()
     except Exception as e:
         print("LLM synth (structured) failed:", e)
         return ""
 
-
 # ---------- /ask ----------
-
 @app.post("/ask")
 async def ask(payload: AskPayload):
     q = (payload.question or "").strip()
@@ -478,8 +491,11 @@ async def ask(payload: AskPayload):
         }
 
     # ----- Broad/thematic path (RAG) -----
+    # Expand query with simple synonyms for better recall (keeps original too)
+    q_expanded = _expand_query(q)
+
     # FTS primary; embeddings optional
-    fts_rows = search_fts(conn, q, limit=12)
+    fts_rows = search_fts(conn, q_expanded, limit=24)
 
     emb = None
     embeddings_used = False
@@ -491,8 +507,31 @@ async def ask(payload: AskPayload):
             print("Embedding query failed:", e)
             embeddings_used = False
 
-    merged = _merge_hits(fts_rows, emb or {})
+    # Merge (keeps FTS order – bm25 relevance)
+    def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int, int, Dict]]:
+        results: List[Tuple[int, int, Dict]] = []
+        seen = set()
+        for r in fts_rows:
+            key = (int(r["chapter"]), int(r["verse"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append((key[0], key[1], dict(r)))
+        if embed_hits and embed_hits.get("metadatas"):
+            for metas in embed_hits["metadatas"]:
+                for m in metas:
+                    ch = int(m.get("chapter") or 0)
+                    v = int(m.get("verse") or 0)
+                    if ch <= 0 or v <= 0:
+                        continue
+                    key = (ch, v)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append((ch, v, m))
+        return results
 
+    merged = _merge_hits(fts_rows, emb or {})
     if not merged:
         return {
             "mode": "broad",
@@ -502,12 +541,22 @@ async def ask(payload: AskPayload):
             "embeddings_used": embeddings_used,
         }
 
-    # Build compact context lines prioritizing commentary2 → commentary1 → translation...
+    # Diversify (chapter bucketing + neighbor suppression)
+    diversified = _diversify_hits(
+        merged,
+        per_chapter=2,            # at most 2 verses per chapter
+        max_total=12,             # consider up to 12 total
+        neighbor_radius=1,        # avoid adjacent verses like 2:48/49/50
+        min_distinct_chapters=3,  # aim for 3+ chapters in context
+    )
+
+    # Build compact context lines: choose best prose per verse; trim
     ctx_lines: List[str] = []
     cites_unique: List[str] = []
     seen_cv = set()
+    chapters_in_ctx: List[str] = []
 
-    for ch, v, data in merged:
+    for ch, v, data in diversified:
         cv_tag = f"{ch}:{v}"
         if cv_tag in seen_cv:
             continue
@@ -523,8 +572,9 @@ async def ask(payload: AskPayload):
 
         ctx_lines.append(f"[{cv_tag}] {block}")
         cites_unique.append(cv_tag)
+        chapters_in_ctx.append(str(ch))
 
-        if len(ctx_lines) >= 10:
+        if len(ctx_lines) >= 10:   # keep context tight
             break
 
     if not ctx_lines:
@@ -536,15 +586,41 @@ async def ask(payload: AskPayload):
             "embeddings_used": embeddings_used,
         }
 
-    # LLM synthesis (~200 words), grounded in the context
-    # ans = _synthesize_from_context(q, ctx_lines, target_words=200)
-    
-    # NEW (structured):
-    ans = _synthesize_structured(q, ctx_lines, max_sections=6)
+    # Structured synthesis (3–5 sections; 400–500 words)
+    ans = _synthesize_structured(
+        q,
+        ctx_lines,
+        min_sections=3,
+        max_sections=5,
+        target_words_low=400,
+        target_words_high=500,
+        enforce_diversity_hint=chapters_in_ctx,
+    )
 
-    # Extract any [2:47]-style citations the model actually used
+    # Post-validate: extract citations & ensure diversity; regenerate once if too weak
     model_cites = _extract_citations_from_text(ans)
-    # Merge with retrieved (model_cites first for relevance)
+    distinct_chapters = {c.split(":")[0] for c in model_cites}
+    needs_retry = False
+    if len(model_cites) < 3:
+        needs_retry = True
+    if len(distinct_chapters) < 3 and len(set(chapters_in_ctx)) >= 3:
+        needs_retry = True
+
+    if needs_retry:
+        ans2 = _synthesize_structured(
+            q,
+            ctx_lines,
+            min_sections=3,
+            max_sections=5,
+            target_words_low=400,
+            target_words_high=500,
+            enforce_diversity_hint=chapters_in_ctx,
+        )
+        if ans2:
+            ans = ans2
+            model_cites = _extract_citations_from_text(ans)
+
+    # Merge model citations with retrieved (model first for relevance)
     ordered: List[str] = []
     seen = set()
     for c in model_cites + cites_unique:
