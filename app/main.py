@@ -1,3 +1,4 @@
+# main.py — Gita Q&A v2 (RAG-enabled broad answers)
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,7 +9,16 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import get_conn, init_db, bulk_upsert, fetch_exact, fetch_neighbors, search_fts, stats, ensure_fts
+from .db import (
+    get_conn,
+    init_db,
+    bulk_upsert,
+    fetch_exact,
+    fetch_neighbors,
+    search_fts,
+    stats,
+    ensure_fts,
+)
 
 from .ingest import load_sheet_to_rows, ingest_commentary
 from . import embed_store
@@ -16,7 +26,10 @@ from . import embed_store
 # --- Environment ---
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
 GEN_MODEL = os.getenv("GEN_MODEL", "gpt-4o-mini")
-NO_MATCH_MESSAGE = os.getenv("NO_MATCH_MESSAGE", "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.")
+NO_MATCH_MESSAGE = os.getenv(
+    "NO_MATCH_MESSAGE",
+    "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.",
+)
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
 USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # set to 1 later to enable embeddings on broad queries
 
@@ -45,7 +58,7 @@ else:
         allow_headers=["*"],
     )
 
-# Serve widget.js at /static/widget.js
+# Serve widget.js at /static/widget.js (served from the app/ directory)
 app.mount("/static", StaticFiles(directory="app"), name="static")
 
 # --- Boot DB ---
@@ -154,8 +167,7 @@ def home():
     """
 
 
-# add ensure_fts to your imports at the top of main.py:
-# from .db import get_conn, init_db, bulk_upsert, fetch_exact, fetch_neighbors, search_fts, stats, ensure_fts
+# ---------- Ingest endpoints ----------
 
 @app.post("/ingest_sheet_sql")
 async def ingest_sheet_sql(file: UploadFile = File(...)):
@@ -164,11 +176,10 @@ async def ingest_sheet_sql(file: UploadFile = File(...)):
         rows = load_sheet_to_rows(bytes_, file.filename)
         conn = get_conn()
         n = bulk_upsert(conn, rows)
-        ensure_fts(conn)  # <— rebuild the contentless FTS index so broad queries work
+        ensure_fts(conn)  # rebuild the contentless FTS index so broad queries work
         return {"ingested_rows": n}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 
 @app.post("/ingest_commentary")
@@ -185,6 +196,8 @@ async def ingest_commentary_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+# ---------- Lookup & debug ----------
 
 @app.get("/title/{ch}/{v}")
 async def get_title(ch: int, v: int):
@@ -215,7 +228,6 @@ async def suggest():
     return {
         "suggestions": [
             "Explain 2:47",
-            "Word meaning 2:47",
             "Which verses talk about devotion?",
             "What is sthita prajna?",
             "Verses on meditation",
@@ -224,36 +236,39 @@ async def suggest():
     }
 
 
-def _extract_ch_verse(text: str) -> Optional[Tuple[int,int]]:
-    m = RE_CV.search(text)
+# ---------- Helpers ----------
+
+def _extract_ch_verse(text: str) -> Optional[Tuple[int, int]]:
+    m = RE_CV.search(text or "")
     if not m:
         return None
-    return (int(m.group(1)), int(m.group(2)))
+    return int(m.group(1)), int(m.group(2))
 
 
 def _is_word_meaning_query(q: str) -> bool:
-    ql = q.lower()
+    ql = (q or "").lower()
     return ("word meaning" in ql) or ("meaning" in ql and RE_CV.search(ql) is not None)
 
 
 def _summarize(prompt: str) -> str:
+    """Light-weight short summary helper used for verse-specific 'Explain'."""
     try:
         rsp = client.chat.completions.create(
             model=GEN_MODEL,
             messages=[
                 {"role": "system", "content": "You answer succinctly in plain text with no markup."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=0.2,
             max_tokens=300,
         )
-        return rsp.choices[0].message.content.strip()
+        return (rsp.choices[0].message.content or "").strip()
     except Exception:
         return ""
 
 
-def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int,int,Dict]]:
-    results = []
+def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int, int, Dict]]:
+    results: List[Tuple[int, int, Dict]] = []
     seen = set()
     for r in fts_rows:
         key = (int(r["chapter"]), int(r["verse"]))
@@ -273,8 +288,90 @@ def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int,int,Di
                     continue
                 seen.add(key)
                 results.append((ch, v, m))
-    return results[:10]
+    return results[:12]
 
+
+# --- New helpers for RAG thematic answers ---
+
+CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
+
+def _clean_text(t: str) -> str:
+    if not t:
+        return ""
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.replace("[C:V]", "").strip()
+
+def _best_text_block(row: Dict[str, Any]) -> str:
+    """Prefer commentary2 → commentary1 → translation → colloquial → roman → title."""
+    for k in ("commentary2", "commentary1", "translation", "colloquial", "roman", "title"):
+        v = row.get(k) or ""
+        v = _clean_text(v)
+        if v:
+            return v
+    return ""
+
+def _extract_citations_from_text(text: str) -> List[str]:
+    out: List[str] = []
+    for m in CITE_RE.finditer(text or ""):
+        ch, v = int(m.group(1)), int(m.group(2))
+        if 1 <= ch <= 18 and 1 <= v <= 200:
+            out.append(f"{ch}:{v}")
+    # unique preserving order
+    seen = set()
+    uniq: List[str] = []
+    for c in out:
+        if c in seen:
+            continue
+        seen.add(c)
+        uniq.append(c)
+    return uniq
+
+def _make_dynamic_suggestions(user_q: str, cites: List[str]) -> List[str]:
+    sug: List[str] = []
+    if cites:
+        show = ", ".join(cites[:5])
+        sug.append(f"Show commentaries for {show}")
+    sug.append("More detail")
+    ql = (user_q or "").lower()
+    if any(w in ql for w in ("how", "what", "why", "ways", "practice", "apply")):
+        sug.append("Practical takeaway")
+    return sug[:4]
+
+def _synthesize_from_context(question: str, ctx_lines: List[str], target_words: int = 200) -> str:
+    """
+    Uses your OpenAI client; precise prompt keeps output grounded, plain-text,
+    ~N words, with [2:47]-style citations.
+    """
+    ctx = "\n".join(ctx_lines)[:8000]  # safety cap
+    prompt = (
+        "You are a Bhagavad Gita assistant. Use ONLY the Context below.\n"
+        "Write a cohesive plain-text answer (~{tw} words). No HTML/Markdown.\n"
+        "Every verse you draw from must be cited inline exactly like [2:47].\n"
+        "If the Context is insufficient, say what is missing.\n\n"
+        f"Question: {question}\n\n"
+        "Context (each line = verse and prose snippet):\n"
+        f"{ctx}\n"
+    ).format(tw=target_words)
+
+    try:
+        rsp = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=[
+                {"role": "system", "content": "Answer grounded in the provided context only. Plain text. Cite verses as [2:47]."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=450,  # ~200 words
+        )
+        return (rsp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("LLM synth failed:", e)
+        return ""
+
+
+# ---------- /ask ----------
 
 @app.post("/ask")
 async def ask(payload: AskPayload):
@@ -286,6 +383,7 @@ async def ask(payload: AskPayload):
     cv = _extract_ch_verse(q)
     conn = get_conn()
 
+    # ----- Verse-specific path (Explain / Word meaning) -----
     if cv:
         ch, v = cv
         row = fetch_exact(conn, ch, v)
@@ -295,6 +393,7 @@ async def ask(payload: AskPayload):
                 return {"answer": NO_MATCH_MESSAGE, "citations": []}
             row = fts_rows[0]
 
+        # Word meaning?
         if _is_word_meaning_query(q):
             wm = row["word_meanings"] or ""
             return {
@@ -302,9 +401,10 @@ async def ask(payload: AskPayload):
                 "chapter": ch,
                 "verse": v,
                 "answer": wm if wm else NO_MATCH_MESSAGE,
-                "citations": [f"[{ch}:{v}]"]
+                "citations": [f"[{ch}:{v}]"],
             }
 
+        # Explain (keep your short summary behavior for verse mode)
         neighbors = fetch_neighbors(conn, ch, v, k=1)
         parts = [(ch, v, row["translation"] or "")]
         for n in neighbors:
@@ -335,11 +435,12 @@ async def ask(payload: AskPayload):
                 {"chapter": int(n["chapter"]), "verse": int(n["verse"]), "translation": n["translation"] or ""}
                 for n in neighbors
             ],
-            "citations": [f"[{ch}:{v}]"]
+            "citations": [f"[{ch}:{v}]"],
         }
 
-    # Broad query: FTS primary; embeddings optional
-    fts_rows = search_fts(conn, q, limit=10)
+    # ----- Broad/thematic path (RAG) -----
+    # FTS primary; embeddings optional
+    fts_rows = search_fts(conn, q, limit=12)
 
     emb = None
     embeddings_used = False
@@ -354,30 +455,66 @@ async def ask(payload: AskPayload):
     merged = _merge_hits(fts_rows, emb or {})
 
     if not merged:
-        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "embeddings_used": embeddings_used}
+        return {
+            "mode": "broad",
+            "answer": NO_MATCH_MESSAGE,
+            "citations": [],
+            "suggestions": [],
+            "embeddings_used": embeddings_used,
+        }
 
+    # Build compact context lines prioritizing commentary2 → commentary1 → translation...
     ctx_lines: List[str] = []
-    cites: List[str] = []
+    cites_unique: List[str] = []
+    seen_cv = set()
+
     for ch, v, data in merged:
-        cites.append(f"[{ch}:{v}]")
-        if isinstance(data, dict) and "translation" in data:
-            s = data.get("translation") or data.get("roman") or data.get("title") or ""
-            if s:
-                ctx_lines.append(f"{ch}:{v} {s}")
+        cv_tag = f"{ch}:{v}"
+        if cv_tag in seen_cv:
+            continue
+        seen_cv.add(cv_tag)
+
+        block = _best_text_block(data if isinstance(data, dict) else {})
+        if not block:
+            continue
+
+        block = _clean_text(block)
+        if len(block) > 600:
+            block = block[:600].rsplit(" ", 1)[0] + "…"
+
+        ctx_lines.append(f"[{cv_tag}] {block}")
+        cites_unique.append(cv_tag)
+
+        if len(ctx_lines) >= 10:
+            break
 
     if not ctx_lines:
-        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": list(dict.fromkeys(cites))[:8], "embeddings_used": embeddings_used}
+        return {
+            "mode": "broad",
+            "answer": NO_MATCH_MESSAGE,
+            "citations": cites_unique[:8],
+            "suggestions": _make_dynamic_suggestions(q, cites_unique[:5]),
+            "embeddings_used": embeddings_used,
+        }
 
-    ctx = "\n".join(ctx_lines)
-    prompt = (
-        "Answer the question using only the provided context. Keep it concise, plain text, no markup. "
-        "Weave in verse citations like [C:V] when relevant.\n\nQuestion: " + q + "\n\nContext:\n" + ctx
-    )
-    ans = _summarize(prompt)
+    # LLM synthesis (~200 words), grounded in the context
+    ans = _synthesize_from_context(q, ctx_lines, target_words=200)
+
+    # Extract any [2:47]-style citations the model actually used
+    model_cites = _extract_citations_from_text(ans)
+    # Merge with retrieved (model_cites first for relevance)
+    ordered: List[str] = []
+    seen = set()
+    for c in model_cites + cites_unique:
+        if c in seen:
+            continue
+        seen.add(c)
+        ordered.append(c)
 
     return {
-        "mode": "broad",
+        "mode": "rag",
         "answer": ans if ans else NO_MATCH_MESSAGE,
-        "citations": list(dict.fromkeys(cites))[:8],
-        "embeddings_used": embeddings_used
+        "citations": ordered[:8],
+        "suggestions": _make_dynamic_suggestions(q, ordered[:5]),
+        "embeddings_used": embeddings_used,
     }
