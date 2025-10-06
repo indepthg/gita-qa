@@ -1,4 +1,4 @@
-# main.py — Gita Q&A v2 (RAG with diversified retrieval + structured synthesis)
+# main.py — Gita Q&A v2 (Explain: summary from commentary2 + More detail; Broad: commentary2-only; Verse listings)
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,10 +34,6 @@ NO_MATCH_MESSAGE = os.getenv(
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
 USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # set to 1 later to enable embeddings on broad queries
 
-# NEW: narrow broad/thematic retrieval to a single source if desired
-# Set RAG_SOURCE=commentary2 to build model context ONLY from commentary2
-RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()
-
 # --- OpenAI client ---
 from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -68,12 +64,6 @@ app.mount("/static", StaticFiles(directory="app"), name="static")
 
 # --- Boot DB ---
 init_db()
-
-RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
-
-class AskPayload(BaseModel):
-    question: str
-    topic: Optional[str] = None
 
 # ---------- Home (unchanged UI) ----------
 @app.get("/", response_class=HTMLResponse)
@@ -224,10 +214,10 @@ async def suggest():
     return {
         "suggestions": [
             "Explain 2:47",
-            "Which verses talk about devotion?",
-            "What is sthita prajna?",
+            "Which verses contain krodha?",
             "Verses on meditation",
-            "Karma vs Bhakti vs Jnana"
+            "What is sthita prajna?",
+            "Karma vs Bhakti vs Jnana",
         ]
     }
 
@@ -245,8 +235,8 @@ def _is_word_meaning_query(q: str) -> bool:
     ql = (q or "").lower()
     return ("word meaning" in ql) or ("meaning" in ql and RE_CV.search(ql) is not None)
 
-def _summarize(prompt: str) -> str:
-    """Light-weight short summary helper used for verse-specific 'Explain'."""
+def _summarize(prompt: str, max_tokens: int = 360, temp: float = 0.2) -> str:
+    """Model helper (plain text; no markup)."""
     try:
         rsp = client.chat.completions.create(
             model=GEN_MODEL,
@@ -254,8 +244,8 @@ def _summarize(prompt: str) -> str:
                 {"role": "system", "content": "You answer succinctly in plain text with no markup."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
-            max_tokens=300,
+            temperature=temp,
+            max_tokens=max_tokens,
         )
         return (rsp.choices[0].message.content or "").strip()
     except Exception:
@@ -269,23 +259,6 @@ def _clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t.replace("[C:V]", "").strip()
 
-def _best_text_block(row: Dict[str, Any], force_source: Optional[str] = None) -> str:
-    """
-    Select best prose block for broad/thematic context.
-    - If force_source == 'commentary2', use only row['commentary2'].
-    - Otherwise, keep your original priority order.
-    """
-    if force_source == "commentary2":
-        v = _clean_text(row.get("commentary2") or "")
-        return v or ""
-    # original multi-field retrieval order
-    for k in ("commentary2", "commentary1", "translation", "colloquial", "roman", "title"):
-        v = row.get(k) or ""
-        v = _clean_text(v)
-        if v:
-            return v
-    return ""
-
 def _extract_citations_from_text(text: str) -> List[str]:
     out: List[str] = []
     for m in CITE_RE.finditer(text or ""):
@@ -296,147 +269,84 @@ def _extract_citations_from_text(text: str) -> List[str]:
     seen = set()
     uniq: List[str] = []
     for c in out:
-        if c in seen:
-            continue
-        seen.add(c)
-        uniq.append(c)
+        if c in seen: continue
+        seen.add(c); uniq.append(c)
     return uniq
 
-def _make_dynamic_suggestions(user_q: str, cites: List[str]) -> List[str]:
-    sug: List[str] = []
-    if cites:
-        show = ", ".join(cites[:5])
-        sug.append(f"Show commentaries for {show}")
-    sug.append("More detail")
-    ql = (user_q or "").lower()
-    if any(w in ql for w in ("how", "what", "why", "ways", "practice", "apply")):
-        sug.append("Practical takeaway")
-    return sug[:4]
+# --- Query type detectors ---
+LIST_RE = re.compile(r"\b(verses?\s+(that\s+)?(contain|mention|talk\s+about|have)\s+)(?P<term>.+)$", re.I)
 
-# --- Light semantic expansion for common themes (improves retrieval recall) ---
-THEME_EXPAND = {
-    "anger": ["anger", "krodha", "wrath", "rage", "ire"],
-    "desire": ["desire", "kama", "craving", "longing"],
-    "self": ["Self", "Atman", "Purusha", "Kshetrajna"],
-    "devotion": ["devotion", "bhakti", "worship", "surrender"],
-    "meditation": ["meditation", "dhyana", "concentration", "mind control"],
-    "detachment": ["detachment", "vairagya", "equanimity", "non-attachment"],
-}
+def _is_listing_query(q: str) -> Optional[str]:
+    m = LIST_RE.search(q or "")
+    if m:
+        return m.group("term").strip()
+    return None
 
-def _expand_query(q: str) -> str:
-    ql = (q or "").lower()
-    terms: List[str] = []
-    for key, syns in THEME_EXPAND.items():
-        if key in ql:
-            terms.extend(syns)
-    if not terms:
-        return q
-    # join with OR to help FTS find any synonym
-    q2 = q + " OR " + " OR ".join(dict.fromkeys(terms))
-    return q2
+def _is_single_term(q: str) -> Optional[str]:
+    # very light heuristic: 1-2 words, not a verse, not a question mark
+    q2 = (q or "").strip()
+    if RE_CV.search(q2): return None
+    if len(q2.split()) <= 2 and " " in q2 or len(q2.split()) == 1:
+        # avoid empty/very short
+        if len(q2) >= 2:
+            return q2
+    return None
 
-# --- Retrieval diversification ---
-def _diversify_hits(merged: List[Tuple[int, int, Dict]],
-                    per_chapter: int = 2,
-                    max_total: int = 10,
-                    neighbor_radius: int = 1,
-                    min_distinct_chapters: int = 3) -> List[Tuple[int, int, Dict]]:
+# --- FTS helpers for composing listing/term answers ---
+def _fts_find_verses(conn, term: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    Greedy diversification:
-      - Keep input order (bm25 relevance) from search_fts.
-      - Cap per-chapter picks.
-      - Suppress near neighbors (same chapter within ±neighbor_radius).
-      - Try to ensure min chapter diversity when possible.
+    Find verses where the TERM appears (prefer commentary2, then translation/title).
+    Returns rows with chapter, verse, title, translation, commentary2.
     """
-    selected: List[Tuple[int, int, Dict]] = []
-    per_ch = defaultdict(int)
+    term = term.strip()
+    if not term: return []
+    # Compose a permissive OR query across fields; unicode61 will handle diacritics
+    q = f'"{term}" OR {term}'
+    rows = search_fts(conn, q, limit=120)  # get a bigger pool; we’ll prune below
 
-    def is_neighbor(ch: int, v: int) -> bool:
-        for (sch, sv, _) in selected:
-            if ch == sch and abs(v - sv) <= neighbor_radius:
-                return True
-        return False
+    # Rank/sort lightly by: has commentary2 hit -> earlier; otherwise translation/title hit
+    scored: List[Tuple[int, Dict[str, Any]]] = []
+    for r in rows:
+        txt_c2 = (r.get("commentary2") or "").lower()
+        txt_tr = (r.get("translation") or "").lower()
+        txt_ti = (r.get("title") or "").lower()
+        score = 0
+        if term.lower() in txt_c2: score += 3
+        if term.lower() in txt_tr: score += 2
+        if term.lower() in txt_ti: score += 1
+        scored.append((score, dict(r)))
 
-    # First pass: respect per-chapter cap & neighbor suppression
-    for ch, v, data in merged:
-        if len(selected) >= max_total:
-            break
-        if per_ch[ch] >= per_chapter:
-            continue
-        if is_neighbor(ch, v):
-            continue
-        selected.append((ch, v, data))
-        per_ch[ch] += 1
+    scored.sort(key=lambda x: (-x[0], int(x[1]["chapter"]), int(x[1]["verse"])))
 
-    # If too few or low diversity, relax neighbor suppression a bit and fill
-    if len({ch for ch, _, _ in selected}) < min_distinct_chapters:
-        for ch, v, data in merged:
-            if len(selected) >= max_total:
-                break
-            if per_ch[ch] >= per_chapter:
-                continue
-            # allow neighbor now, but still avoid exact duplicates
-            if any((ch == sch and v == sv) for sch, sv, _ in selected):
-                continue
-            selected.append((ch, v, data))
-            per_ch[ch] += 1
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for _, r in scored:
+        cv = (int(r["chapter"]), int(r["verse"]))
+        if cv in seen: continue
+        seen.add(cv)
+        out.append(r)
+        if len(out) >= limit: break
+    return out
 
-    return selected[:max_total]
-
-# --- Structured synthesis (3–5 sections; 400–500 words) ---
-def _synthesize_structured(question: str, ctx_lines: List[str],
-                           min_sections: int = 3,
-                           max_sections: int = 5,
-                           target_words_low: int = 400,
-                           target_words_high: int = 500,
-                           enforce_diversity_hint: Optional[List[str]] = None) -> str:
-    """
-    Output format (plain text):
-      1) <Short Title>
-      <2–4 sentences> [2:47] [3:19]
-
-      2) <Short Title>
-      <2–4 sentences> [9:22]
-    """
-    ctx = "\n".join(ctx_lines)[:8000]
-    diversity_hint = ""
-    if enforce_diversity_hint:
-        diversity_hint = (
-            "Broaden citations across chapters where possible; avoid clustering from adjacent verses. "
-            f"Prefer using at least these distinct chapters if relevant: {', '.join(sorted(set(enforce_diversity_hint)))}.\n"
-        )
+# --- Structured synthesis (broad, commentary2-only, 2 paragraphs) ---
+def _synthesize_broad_from_c2(question: str, ctx_lines: List[str]) -> str:
+    ctx = "\n".join(ctx_lines)[:6000]
     prompt = (
-        "You are a Bhagavad Gita assistant. Use ONLY the Context below.\n"
-        f"Write a structured answer with {min_sections}–{max_sections} thematic sections. For each section:\n"
-        "- Start with 'N) <Short Title>' on its own line (N = 1..5)\n"
-        "- Then 2–4 sentences of plain text (no bullets/markdown), grounded in Context\n"
-        "- Include verse citations inline as [chapter:verse] at the end of the sentences that use them\n"
-        "Global constraints:\n"
-        f"- Total length ≈ {target_words_low}–{target_words_high} words\n"
-        "- Use ONLY context; if insufficient, say what's missing\n"
-        "- Use at least 3 distinct verses overall and aim for at least 3 distinct chapters if the Context allows\n"
-        "- Do not invent sources or verses\n"
-        f"{diversity_hint}\n"
+        "Use ONLY the Context below (excerpts from commentary2). "
+        "Write 2–3 natural paragraphs, no bullets/sections, plain text. "
+        "Include inline verse refs like [2:47] when the sentence uses them. "
+        "If context is insufficient, say so briefly.\n\n"
         f"Question: {question}\n\n"
         "Context (each line = [chapter:verse] prose):\n"
         f"{ctx}\n"
     )
-    try:
-        rsp = client.chat.completions.create(
-            model=GEN_MODEL,
-            messages=[
-                {"role": "system", "content": "Answer ONLY from the provided context. Plain text. Use [chapter:verse] citations."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=900,  # accommodates ~500 words
-        )
-        return (rsp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print("LLM synth (structured) failed:", e)
-        return ""
+    return _summarize(prompt, max_tokens=520, temp=0.3)
 
 # ---------- /ask ----------
+class AskPayload(BaseModel):
+    question: str
+    topic: Optional[str] = None
+
 @app.post("/ask")
 async def ask(payload: AskPayload):
     q = (payload.question or "").strip()
@@ -444,10 +354,33 @@ async def ask(payload: AskPayload):
         raise HTTPException(status_code=400, detail="Empty question")
 
     topic = payload.topic or TOPIC_DEFAULT
-    cv = _extract_ch_verse(q)
     conn = get_conn()
 
-    # ----- Verse-specific path (Explain / Word meaning) -----
+    # ----- "More detail X.Y" requests -----
+    m_more = re.search(r"\bmore\s+detail\b.*?(\d{1,2})[:\.](\d{1,3})", q, re.I)
+    if m_more:
+        ch, v = int(m_more.group(1)), int(m_more.group(2))
+        row = fetch_exact(conn, ch, v)
+        if not row:
+            return {"answer": f"Chapter {ch}, Verse {v} does not exist.", "citations": []}
+        c2 = _clean_text(row.get("commentary2") or "")
+        c1 = _clean_text(row.get("commentary1") or "")
+        blocks: List[str] = []
+        if c2:
+            blocks.append("Commentary:\n" + c2)
+        if c1:
+            blocks.append("Shankara's commentary:\n" + c1)
+        return {
+            "mode": "detail",
+            "chapter": ch,
+            "verse": v,
+            "answer": "\n\n".join(blocks) if blocks else "No commentary available.",
+            "citations": [f"[{ch}:{v}]"],
+            "suggestions": []
+        }
+
+    # ----- Verse-specific "Explain X.Y" (or any X.Y) -----
+    cv = _extract_ch_verse(q)
     if cv:
         ch, v = cv
         row = fetch_exact(conn, ch, v)
@@ -457,200 +390,141 @@ async def ask(payload: AskPayload):
                 return {"answer": NO_MATCH_MESSAGE, "citations": []}
             row = fts_rows[0]
 
-        # Word meaning?
-        if _is_word_meaning_query(q):
-            wm = row["word_meanings"] or ""
-            return {
-                "mode": "word_meaning",
-                "chapter": ch,
-                "verse": v,
-                "answer": wm if wm else NO_MATCH_MESSAGE,
-                "citations": [f"[{ch}:{v}]"],
-            }
+        c2 = _clean_text(row.get("commentary2") or "")
+        # If no commentary2, fall back to translation for summary
+        base_txt = c2 if c2 else _clean_text(row.get("translation") or "")
 
-        # Explain (keep your short summary behavior for verse mode)
-        neighbors = fetch_neighbors(conn, ch, v, k=1)
-        parts = [(ch, v, row["translation"] or "")]
-        for n in neighbors:
-            parts.append((int(n["chapter"]), int(n["verse"]), n["translation"] or ""))
-
-        context_txt = "\n".join([f"{c}:{vv} {t}".strip() for c, vv, t in parts if t])
-        prompt = (
-            "Summarize the central teaching of this verse in 2-3 plain sentences, "
-            "no formatting, and include the citation [C:V] somewhere in the text.\n\n" + context_txt
+        # Generate summary FROM commentary2 (or fallback)
+        summary_prompt = (
+            "Summarize the following in 2–4 sentences, plain text, no markup. "
+            "Include at least one inline citation like [C:V] using the verse number provided.\n\n"
+            f"Verse: {ch}:{v}\n"
+            f"Text:\n{base_txt}\n"
         )
-        summary = _summarize(prompt)
+        summary = _summarize(summary_prompt, max_tokens=220, temp=0.2)
 
+        # Build response object
+        neighbors = fetch_neighbors(conn, ch, v, k=1)
         return {
             "mode": "explain",
             "chapter": ch,
             "verse": v,
-            "title": row["title"] or "",
-            "sanskrit": row["sanskrit"] or "",
-            "roman": row["roman"] or "",
-            "colloquial": row["colloquial"] or "",
-            "translation": row["translation"] or "",
-            "word_meanings": row["word_meanings"] or "",
-            "capsule_url": row["capsule_url"] or "",
-            "commentary1": row["commentary1"] or "",
-            "commentary2": row["commentary2"] or "",
+            "title": row.get("title") or "",
+            "sanskrit": row.get("sanskrit") or "",
+            "roman": row.get("roman") or "",
+            "colloquial": row.get("colloquial") or "",
+            "translation": row.get("translation") or "",
+            "word_meanings": row.get("word_meanings") or "",
+            "capsule_url": row.get("capsule_url") or "",
+            "commentary1": row.get("commentary1") or "",
+            "commentary2": row.get("commentary2") or "",
+            # NEW: Summary comes from commentary2 (prefixed client-side)
             "summary": summary or "",
             "neighbors": [
                 {"chapter": int(n["chapter"]), "verse": int(n["verse"]), "translation": n["translation"] or ""}
                 for n in neighbors
             ],
-            "citations": [f"[{ch}:{v}]"],
-        }
-
-    # ----- Broad/thematic path (RAG) -----
-    # Expand query with simple synonyms for better recall (keeps original too)
-    q_expanded = _expand_query(q)
-
-    # FTS primary; embeddings optional
-    fts_rows = search_fts(conn, q_expanded, limit=24)
-
-    emb = None
-    embeddings_used = False
-    if USE_EMBED:
-        try:
-            emb = embed_store.query(q, top_k=6, where={"topic": topic})
-            embeddings_used = True
-        except Exception as e:
-            print("Embedding query failed:", e)
-            embeddings_used = False
-
-    # Merge (keeps FTS order – bm25 relevance)
-    def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int, int, Dict]]:
-        results: List[Tuple[int, int, Dict]] = []
-        seen = set()
-        for r in fts_rows:
-            key = (int(r["chapter"]), int(r["verse"]))
-            if key in seen:
-                continue
-            seen.add(key)
-            results.append((key[0], key[1], dict(r)))
-        if embed_hits and embed_hits.get("metadatas"):
-            for metas in embed_hits["metadatas"]:
-                for m in metas:
-                    ch = int(m.get("chapter") or 0)
-                    v = int(m.get("verse") or 0)
-                    if ch <= 0 or v <= 0:
-                        continue
-                    key = (ch, v)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    results.append((ch, v, m))
-        return results
-
-    merged = _merge_hits(fts_rows, emb or {})
-    if not merged:
-        return {
-            "mode": "broad",
-            "answer": NO_MATCH_MESSAGE,
+            # IMPORTANT: no top citation pill in Explain mode (you asked to hide it)
             "citations": [],
-            "suggestions": [],
-            "embeddings_used": embeddings_used,
+            "suggestions": [f"More detail {ch}.{v}"]
         }
 
-    # Diversify (chapter bucketing + neighbor suppression)
-    diversified = _diversify_hits(
-        merged,
-        per_chapter=2,            # at most 2 verses per chapter
-        max_total=12,             # consider up to 12 total
-        neighbor_radius=1,        # avoid adjacent verses like 2:48/49/50
-        min_distinct_chapters=3,  # aim for 3+ chapters in context
-    )
+    # ----- Listing queries like "Which verses contain krodha" -----
+    term_for_list = _is_listing_query(q)
+    if term_for_list:
+        verses = _fts_find_verses(conn, term_for_list, limit=20)
+        if not verses:
+            return {"mode": "list", "answer": NO_MATCH_MESSAGE, "citations": [], "suggestions": []}
 
-    # Build compact context lines: choose best prose per verse; trim
+        # Build plain-text list; include [C:V] to make them clickable in your widget
+        lines: List[str] = []
+        for r in verses:
+            ch, v = int(r["chapter"]), int(r["verse"])
+            title = _clean_text(r.get("title") or "")
+            trans = _clean_text(r.get("translation") or "")
+            block = f"{ch}:{v} — {title}\n{trans}\n[{ch}:{v}]"
+            lines.append(block)
+        answer = "\n\n".join(lines)
+        return {
+            "mode": "list",
+            "answer": answer,
+            "citations": [],  # inline [C:V] makes them clickable already
+            "suggestions": []
+        }
+
+    # ----- Single-term queries like "krodha" (define + list) -----
+    term = _is_single_term(q)
+    if term:
+        verses = _fts_find_verses(conn, term, limit=20)
+
+        # Short definition from commentary2 context
+        ctx_lines: List[str] = []
+        for r in verses[:8]:
+            ch, v = int(r["chapter"]), int(r["verse"])
+            c2 = _clean_text(r.get("commentary2") or "")
+            if c2:
+                snippet = c2 if len(c2) < 320 else c2[:320].rsplit(" ", 1)[0] + "…"
+                ctx_lines.append(f"[{ch}:{v}] {snippet}")
+
+        definition = ""
+        if ctx_lines:
+            definition = _synthesize_broad_from_c2(f"What does the term '{term}' mean in the Gita? Define briefly.", ctx_lines)
+
+        # Verse list (as above)
+        if verses:
+            lines: List[str] = []
+            for r in verses:
+                ch, v = int(r["chapter"]), int(r["verse"])
+                title = _clean_text(r.get("title") or "")
+                trans = _clean_text(r.get("translation") or "")
+                block = f"{ch}:{v} — {title}\n{trans}\n[{ch}:{v}]"
+                lines.append(block)
+            listing = "\n\n".join(lines)
+            answer = (definition + "\n\n" if definition else "") + listing
+            return {
+                "mode": "term",
+                "answer": answer,
+                "citations": [],
+                "suggestions": []
+            }
+        else:
+            return {
+                "mode": "term",
+                "answer": definition or NO_MATCH_MESSAGE,
+                "citations": [],
+                "suggestions": []
+            }
+
+    # ----- Broad/thematic questions: commentary2-only, 2–3 paragraphs -----
+    fts_rows = search_fts(conn, q, limit=24)
+    if not fts_rows:
+        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "suggestions": []}
+
+    # Build context strictly from commentary2
     ctx_lines: List[str] = []
-    cites_unique: List[str] = []
-    seen_cv = set()
-    chapters_in_ctx: List[str] = []
-
-    force_source = "commentary2" if RAG_SOURCE == "commentary2" else None
-
-    for ch, v, data in diversified:
-        cv_tag = f"{ch}:{v}"
-        if cv_tag in seen_cv:
-            continue
-        seen_cv.add(cv_tag)
-
-        block = _best_text_block(data if isinstance(data, dict) else {}, force_source=force_source)
-        if not block:
-            # if forcing commentary2 and this verse lacks it, skip it
-            if force_source:
-                continue
-            else:
-                continue  # keep behavior consistent: only include verses with a usable block
-
-        block = _clean_text(block)
-        if len(block) > 600:
-            block = block[:600].rsplit(" ", 1)[0] + "…"
-
-        ctx_lines.append(f"[{cv_tag}] {block}")
-        cites_unique.append(cv_tag)
-        chapters_in_ctx.append(str(ch))
-
-        if len(ctx_lines) >= 10:   # keep context tight
+    cites: List[str] = []
+    seen = set()
+    for r in fts_rows:
+        ch, v = int(r["chapter"]), int(r["verse"])
+        cv = (ch, v)
+        if cv in seen: continue
+        seen.add(cv)
+        c2 = _clean_text(r.get("commentary2") or "")
+        if not c2: continue
+        short = c2 if len(c2) < 480 else c2[:480].rsplit(" ", 1)[0] + "…"
+        ctx_lines.append(f"[{ch}:{v}] {short}")
+        cites.append(f"{ch}:{v}")
+        if len(ctx_lines) >= 10:
             break
 
     if not ctx_lines:
-        return {
-            "mode": "broad",
-            "answer": NO_MATCH_MESSAGE,
-            "citations": cites_unique[:8],
-            "suggestions": _make_dynamic_suggestions(q, cites_unique[:5]),
-            "embeddings_used": embeddings_used,
-        }
+        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "suggestions": []}
 
-    # Structured synthesis (3–5 sections; 400–500 words)
-    ans = _synthesize_structured(
-        q,
-        ctx_lines,
-        min_sections=3,
-        max_sections=5,
-        target_words_low=400,
-        target_words_high=500,
-        enforce_diversity_hint=chapters_in_ctx,
-    )
-
-    # Post-validate: extract citations & ensure diversity; regenerate once if too weak
-    model_cites = _extract_citations_from_text(ans)
-    distinct_chapters = {c.split(":")[0] for c in model_cites}
-    needs_retry = False
-    if len(model_cites) < 3:
-        needs_retry = True
-    if len(distinct_chapters) < 3 and len(set(chapters_in_ctx)) >= 3:
-        needs_retry = True
-
-    if needs_retry:
-        ans2 = _synthesize_structured(
-            q,
-            ctx_lines,
-            min_sections=3,
-            max_sections=5,
-            target_words_low=400,
-            target_words_high=500,
-            enforce_diversity_hint=chapters_in_ctx,
-        )
-        if ans2:
-            ans = ans2
-            model_cites = _extract_citations_from_text(ans)
-
-    # Merge model citations with retrieved (model first for relevance)
-    ordered: List[str] = []
-    seen = set()
-    for c in model_cites + cites_unique:
-        if c in seen:
-            continue
-        seen.add(c)
-        ordered.append(c)
+    ans = _synthesize_broad_from_c2(q, ctx_lines)
 
     return {
-        "mode": "rag",
+        "mode": "broad",
         "answer": ans if ans else NO_MATCH_MESSAGE,
-        "citations": ordered[:8],
-        "suggestions": _make_dynamic_suggestions(q, ordered[:5]),
-        "embeddings_used": embeddings_used,
+        "citations": list(dict.fromkeys(cites))[:8],
+        "suggestions": [f"More detail {q}"]
     }
