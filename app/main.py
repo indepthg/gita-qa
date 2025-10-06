@@ -34,6 +34,10 @@ NO_MATCH_MESSAGE = os.getenv(
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
 USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # set to 1 later to enable embeddings on broad queries
 
+# NEW: narrow broad/thematic retrieval to a single source if desired
+# Set RAG_SOURCE=commentary2 to build model context ONLY from commentary2
+RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()
+
 # --- OpenAI client ---
 from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -265,8 +269,16 @@ def _clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t.replace("[C:V]", "").strip()
 
-def _best_text_block(row: Dict[str, Any]) -> str:
-    """Prefer commentary2 → commentary1 → translation → colloquial → roman → title."""
+def _best_text_block(row: Dict[str, Any], force_source: Optional[str] = None) -> str:
+    """
+    Select best prose block for broad/thematic context.
+    - If force_source == 'commentary2', use only row['commentary2'].
+    - Otherwise, keep your original priority order.
+    """
+    if force_source == "commentary2":
+        v = _clean_text(row.get("commentary2") or "")
+        return v or ""
+    # original multi-field retrieval order
     for k in ("commentary2", "commentary1", "translation", "colloquial", "roman", "title"):
         v = row.get(k) or ""
         v = _clean_text(v)
@@ -556,15 +568,21 @@ async def ask(payload: AskPayload):
     seen_cv = set()
     chapters_in_ctx: List[str] = []
 
+    force_source = "commentary2" if RAG_SOURCE == "commentary2" else None
+
     for ch, v, data in diversified:
         cv_tag = f"{ch}:{v}"
         if cv_tag in seen_cv:
             continue
         seen_cv.add(cv_tag)
 
-        block = _best_text_block(data if isinstance(data, dict) else {})
+        block = _best_text_block(data if isinstance(data, dict) else {}, force_source=force_source)
         if not block:
-            continue
+            # if forcing commentary2 and this verse lacks it, skip it
+            if force_source:
+                continue
+            else:
+                continue  # keep behavior consistent: only include verses with a usable block
 
         block = _clean_text(block)
         if len(block) > 600:
