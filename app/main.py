@@ -1,4 +1,4 @@
-# main.py — Gita Q&A v2 (Explain: summary from commentary2 + More detail; Broad: commentary2-only; Verse listings)
+# main.py — Gita Q&A v2 (Explain summary from commentary2 + term lists + safe RAG)
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,7 +20,6 @@ from .db import (
     stats,
     ensure_fts,
 )
-
 from .ingest import load_sheet_to_rows, ingest_commentary
 from . import embed_store
 
@@ -32,7 +31,10 @@ NO_MATCH_MESSAGE = os.getenv(
     "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.",
 )
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
-USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # set to 1 later to enable embeddings on broad queries
+USE_EMBED = os.getenv("USE_EMBED", "0") == "1"
+
+# Optional: restrict broad/thematic RAG to commentary2 only
+RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()  # "" or "commentary2"
 
 # --- OpenAI client ---
 from openai import OpenAI
@@ -59,13 +61,13 @@ else:
         allow_headers=["*"],
     )
 
-# Serve widget.js at /static/widget.js (served from the app/ directory)
+# Serve widget.js from /app
 app.mount("/static", StaticFiles(directory="app"), name="static")
 
 # --- Boot DB ---
 init_db()
 
-# ---------- Home (unchanged UI) ----------
+# ---------- UI (unchanged) ----------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -103,14 +105,12 @@ def home():
     .head{ display:flex; align-items:baseline; justify-content:space-between; padding:18px 22px; border-bottom:1px solid var(--border); }
     .title{ font-size:20px; font-weight:700; letter-spacing:.2px; }
     .topic{ font-size:12px; color:var(--muted); }
-
     .body{ display:flex; flex-direction:column; gap:12px; padding:14px 22px 8px; }
     .pills{ display:flex; flex-wrap:wrap; gap:8px; padding:6px 0 2px; }
     .pills .pill{
       padding:6px 10px; border-radius:999px; border:1px solid var(--pill-border); background:var(--pill); color:var(--text);
       cursor:pointer; font-size:12px;
     }
-
     .form{ display:flex; gap:10px; align-items:center; padding-top:8px; border-top:1px solid var(--border); margin-top:8px; position:sticky; bottom:0; background:var(--card); }
     .input{ flex:1; padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:transparent; color:var(--text); outline:none; font-size:15px; }
     .send{
@@ -139,10 +139,9 @@ def home():
 <script>
 (function () {
   var s = document.createElement('script');
-  s.src = '/static/widget.js?v=' + Date.now();   // auto cache-buster
-  s.async = true;                                // don't block page render
+  s.src = '/static/widget.js?v=' + Date.now();
+  s.async = true;
   s.onload = function () {
-    // only run once widget.js is ready
     if (window.GitaWidget && GitaWidget.mount) {
       GitaWidget.mount({ root: '#gita', apiBase: '' });
       console.log('[GW] mounted via dynamic loader');
@@ -150,9 +149,7 @@ def home():
       console.error('GitaWidget not found after load');
     }
   };
-  s.onerror = function (e) {
-    console.error('Failed to load widget.js', e);
-  };
+  s.onerror = function (e) { console.error('Failed to load widget.js', e); };
   document.head.appendChild(s);
 })();
 </script>
@@ -160,7 +157,7 @@ def home():
 </html>
     """
 
-# ---------- Ingest endpoints ----------
+# ---------- Ingest ----------
 @app.post("/ingest_sheet_sql")
 async def ingest_sheet_sql(file: UploadFile = File(...)):
     try:
@@ -168,7 +165,7 @@ async def ingest_sheet_sql(file: UploadFile = File(...)):
         rows = load_sheet_to_rows(bytes_, file.filename)
         conn = get_conn()
         n = bulk_upsert(conn, rows)
-        ensure_fts(conn)  # rebuild the contentless FTS index so broad queries work
+        ensure_fts(conn)
         return {"ingested_rows": n}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -187,7 +184,7 @@ async def ingest_commentary_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- Lookup & debug ----------
+# ---------- Debug helpers ----------
 @app.get("/title/{ch}/{v}")
 async def get_title(ch: int, v: int):
     conn = get_conn()
@@ -211,37 +208,29 @@ async def debug_stats():
 
 @app.get("/suggest")
 async def suggest():
-    return {
-        "suggestions": [
-            "Explain 2:47",
-            "Which verses contain krodha?",
-            "Verses on meditation",
-            "What is sthita prajna?",
-            "Karma vs Bhakti vs Jnana",
-        ]
-    }
+    return { "suggestions": [
+        "Explain 2:47",
+        "Which verses talk about devotion?",
+        "What is sthita prajna?",
+        "Verses on meditation",
+        "Karma vs Bhakti vs Jnana"
+    ]}
 
-# ---------- Helpers ----------
-RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
+# ---------- Core helpers ----------
+RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,3})\b")
 CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
 
 def _extract_ch_verse(text: str) -> Optional[Tuple[int, int]]:
     m = RE_CV.search(text or "")
-    if not m:
-        return None
+    if not m: return None
     return int(m.group(1)), int(m.group(2))
 
-def _is_word_meaning_query(q: str) -> bool:
-    ql = (q or "").lower()
-    return ("word meaning" in ql) or ("meaning" in ql and RE_CV.search(ql) is not None)
-
-def _summarize(prompt: str, max_tokens: int = 360, temp: float = 0.2) -> str:
-    """Model helper (plain text; no markup)."""
+def _summarize(prompt: str, max_tokens: int = 320, temp: float = 0.2) -> str:
     try:
         rsp = client.chat.completions.create(
             model=GEN_MODEL,
             messages=[
-                {"role": "system", "content": "You answer succinctly in plain text with no markup."},
+                {"role": "system", "content": "Plain text only. No markup. Be concise and faithful to the provided text."},
                 {"role": "user", "content": prompt},
             ],
             temperature=temp,
@@ -252,12 +241,19 @@ def _summarize(prompt: str, max_tokens: int = 360, temp: float = 0.2) -> str:
         return ""
 
 def _clean_text(t: str) -> str:
-    if not t:
-        return ""
+    if not t: return ""
     t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
     t = re.sub(r"<[^>]+>", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t.replace("[C:V]", "").strip()
+
+def _best_text_block(row: Dict[str, Any], force_source: Optional[str] = None) -> str:
+    if force_source == "commentary2":
+        return _clean_text(row.get("commentary2") or "")
+    for k in ("commentary2", "commentary1", "translation", "colloquial", "roman", "title"):
+        v = _clean_text(row.get(k) or "")
+        if v: return v
+    return ""
 
 def _extract_citations_from_text(text: str) -> List[str]:
     out: List[str] = []
@@ -265,82 +261,78 @@ def _extract_citations_from_text(text: str) -> List[str]:
         ch, v = int(m.group(1)), int(m.group(2))
         if 1 <= ch <= 18 and 1 <= v <= 200:
             out.append(f"{ch}:{v}")
-    # unique preserving order
+    uniq = []
     seen = set()
-    uniq: List[str] = []
     for c in out:
         if c in seen: continue
         seen.add(c); uniq.append(c)
     return uniq
 
-# --- Query type detectors ---
-LIST_RE = re.compile(r"\b(verses?\s+(that\s+)?(contain|mention|talk\s+about|have)\s+)(?P<term>.+)$", re.I)
+# very small theme expansion (keeps your earlier behavior)
+THEME_EXPAND = {
+    "anger": ["anger", "krodha", "wrath", "rage", "ire"],
+    "desire": ["desire", "kama", "craving", "longing"],
+    "self": ["Self", "Atman", "Purusha", "Kshetrajna"],
+    "devotion": ["devotion", "bhakti", "worship", "surrender"],
+    "meditation": ["meditation", "dhyana", "concentration", "mind control"],
+    "detachment": ["detachment", "vairagya", "equanimity", "non-attachment"],
+}
+def _expand_query(q: str) -> str:
+    ql = (q or "").lower()
+    terms: List[str] = []
+    for key, syns in THEME_EXPAND.items():
+        if key in ql: terms.extend(syns)
+    if not terms: return q
+    return q + " OR " + " OR ".join(dict.fromkeys(terms))
 
-def _is_listing_query(q: str) -> Optional[str]:
-    m = LIST_RE.search(q or "")
+def _diversify_hits(merged: List[Tuple[int,int,Dict]],
+                    per_chapter:int=2, max_total:int=12,
+                    neighbor_radius:int=1, min_distinct_chapters:int=3) -> List[Tuple[int,int,Dict]]:
+    selected: List[Tuple[int,int,Dict]] = []
+    per_ch = defaultdict(int)
+    def is_neighbor(ch:int,v:int)->bool:
+        for sch,sv,_ in selected:
+            if ch==sch and abs(v-sv)<=neighbor_radius: return True
+        return False
+    for ch,v,data in merged:
+        if len(selected)>=max_total: break
+        if per_ch[ch]>=per_chapter: continue
+        if is_neighbor(ch,v): continue
+        selected.append((ch,v,data)); per_ch[ch]+=1
+    if len({ch for ch,_,_ in selected})<min_distinct_chapters:
+        for ch,v,data in merged:
+            if len(selected)>=max_total: break
+            if per_ch[ch]>=per_chapter: continue
+            if any((ch==sch and v==sv) for sch,sv,_ in selected): continue
+            selected.append((ch,v,data)); per_ch[ch]+=1
+    return selected[:max_total]
+
+# ---------- Term-mode detection ----------
+TERM_ASK_RE = re.compile(r"\bwhich\s+verses?\s+(contain|mention|talk\s+about|include)\s+(.+)", re.I)
+def _looks_like_term_query(q: str) -> Optional[str]:
+    """Return the term if it looks like a term search; else None."""
+    q = (q or "").strip()
+    m = TERM_ASK_RE.search(q)
     if m:
-        return m.group("term").strip()
+        term = m.group(2).strip()
+        term = re.sub(r"[?.!,;:]$", "", term)
+        return term
+    # simple single/dual-token heuristic (no chapter:verse present)
+    if not RE_CV.search(q):
+        parts = re.findall(r"[A-Za-zĀ-ž\-']+", q)
+        if 1 <= len(parts) <= 2:
+            return " ".join(parts)
     return None
 
-def _is_single_term(q: str) -> Optional[str]:
-    # very light heuristic: 1-2 words, not a verse, not a question mark
-    q2 = (q or "").strip()
-    if RE_CV.search(q2): return None
-    if len(q2.split()) <= 2 and " " in q2 or len(q2.split()) == 1:
-        # avoid empty/very short
-        if len(q2) >= 2:
-            return q2
-    return None
-
-# --- FTS helpers for composing listing/term answers ---
-def _fts_find_verses(conn, term: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Find verses where the TERM appears (prefer commentary2, then translation/title).
-    Returns rows with chapter, verse, title, translation, commentary2.
-    """
-    term = term.strip()
-    if not term: return []
-    # Compose a permissive OR query across fields; unicode61 will handle diacritics
-    q = f'"{term}" OR {term}'
-    rows = search_fts(conn, q, limit=120)  # get a bigger pool; we’ll prune below
-
-    # Rank/sort lightly by: has commentary2 hit -> earlier; otherwise translation/title hit
-    scored: List[Tuple[int, Dict[str, Any]]] = []
-    for r in rows:
-        txt_c2 = (r.get("commentary2") or "").lower()
-        txt_tr = (r.get("translation") or "").lower()
-        txt_ti = (r.get("title") or "").lower()
-        score = 0
-        if term.lower() in txt_c2: score += 3
-        if term.lower() in txt_tr: score += 2
-        if term.lower() in txt_ti: score += 1
-        scored.append((score, dict(r)))
-
-    scored.sort(key=lambda x: (-x[0], int(x[1]["chapter"]), int(x[1]["verse"])))
-
-    out: List[Dict[str, Any]] = []
-    seen = set()
-    for _, r in scored:
-        cv = (int(r["chapter"]), int(r["verse"]))
-        if cv in seen: continue
-        seen.add(cv)
-        out.append(r)
-        if len(out) >= limit: break
-    return out
-
-# --- Structured synthesis (broad, commentary2-only, 2 paragraphs) ---
-def _synthesize_broad_from_c2(question: str, ctx_lines: List[str]) -> str:
+# ---------- Synthesis (2 paragraphs for broad answers) ----------
+def _synthesize_two_paras(question:str, ctx_lines:List[str]) -> str:
     ctx = "\n".join(ctx_lines)[:6000]
     prompt = (
-        "Use ONLY the Context below (excerpts from commentary2). "
-        "Write 2–3 natural paragraphs, no bullets/sections, plain text. "
-        "Include inline verse refs like [2:47] when the sentence uses them. "
-        "If context is insufficient, say so briefly.\n\n"
-        f"Question: {question}\n\n"
-        "Context (each line = [chapter:verse] prose):\n"
-        f"{ctx}\n"
+        "You are a Bhagavad Gita assistant. Use ONLY the Context lines below.\n"
+        "Write 2 short paragraphs (plain text, no bullets). Weave citations like [chapter:verse] when relevant.\n"
+        f"Question: {question}\n\nContext (each line = [chapter:verse] prose):\n{ctx}\n"
     )
-    return _summarize(prompt, max_tokens=520, temp=0.3)
+    return _summarize(prompt, max_tokens=480, temp=0.2)
 
 # ---------- /ask ----------
 class AskPayload(BaseModel):
@@ -352,34 +344,10 @@ async def ask(payload: AskPayload):
     q = (payload.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Empty question")
-
     topic = payload.topic or TOPIC_DEFAULT
     conn = get_conn()
 
-    # ----- "More detail X.Y" requests -----
-    m_more = re.search(r"\bmore\s+detail\b.*?(\d{1,2})[:\.](\d{1,3})", q, re.I)
-    if m_more:
-        ch, v = int(m_more.group(1)), int(m_more.group(2))
-        row = fetch_exact(conn, ch, v)
-        if not row:
-            return {"answer": f"Chapter {ch}, Verse {v} does not exist.", "citations": []}
-        c2 = _clean_text(row.get("commentary2") or "")
-        c1 = _clean_text(row.get("commentary1") or "")
-        blocks: List[str] = []
-        if c2:
-            blocks.append("Commentary:\n" + c2)
-        if c1:
-            blocks.append("Shankara's commentary:\n" + c1)
-        return {
-            "mode": "detail",
-            "chapter": ch,
-            "verse": v,
-            "answer": "\n\n".join(blocks) if blocks else "No commentary available.",
-            "citations": [f"[{ch}:{v}]"],
-            "suggestions": []
-        }
-
-    # ----- Verse-specific "Explain X.Y" (or any X.Y) -----
+    # 1) Explain / verse path
     cv = _extract_ch_verse(q)
     if cv:
         ch, v = cv
@@ -390,21 +358,21 @@ async def ask(payload: AskPayload):
                 return {"answer": NO_MATCH_MESSAGE, "citations": []}
             row = fts_rows[0]
 
-        c2 = _clean_text(row.get("commentary2") or "")
-        # If no commentary2, fall back to translation for summary
-        base_txt = c2 if c2 else _clean_text(row.get("translation") or "")
+        # Build a summary **from commentary2** (fallbacks: commentary1 → translation)
+        base = _clean_text(row.get("commentary2") or "") \
+               or _clean_text(row.get("commentary1") or "") \
+               or _clean_text(row.get("translation") or "")
+        summary = ""
+        if base:
+            prompt = (
+                f"Summarize the following commentary into 2–3 plain sentences. "
+                f"Keep it faithful. Include the citation [C:V] somewhere.\n\n{base}"
+            )
+            summary = _summarize(prompt)
 
-        # Generate summary FROM commentary2 (or fallback)
-        summary_prompt = (
-            "Summarize the following in 2–4 sentences, plain text, no markup. "
-            "Include at least one inline citation like [C:V] using the verse number provided.\n\n"
-            f"Verse: {ch}:{v}\n"
-            f"Text:\n{base_txt}\n"
-        )
-        summary = _summarize(summary_prompt, max_tokens=220, temp=0.2)
+        # Suggestions: include a **fully qualified pill** for more detail
+        suggestions = [f"More detail on {ch}:{v}"]
 
-        # Build response object
-        neighbors = fetch_neighbors(conn, ch, v, k=1)
         return {
             "mode": "explain",
             "chapter": ch,
@@ -414,117 +382,140 @@ async def ask(payload: AskPayload):
             "roman": row.get("roman") or "",
             "colloquial": row.get("colloquial") or "",
             "translation": row.get("translation") or "",
-            "word_meanings": row.get("word_meanings") or "",
-            "capsule_url": row.get("capsule_url") or "",
-            "commentary1": row.get("commentary1") or "",
-            "commentary2": row.get("commentary2") or "",
-            # NEW: Summary comes from commentary2 (prefixed client-side)
+            # hide commentaries on first pass (widget shows only present fields)
             "summary": summary or "",
-            "neighbors": [
-                {"chapter": int(n["chapter"]), "verse": int(n["verse"]), "translation": n["translation"] or ""}
-                for n in neighbors
-            ],
-            # IMPORTANT: no top citation pill in Explain mode (you asked to hide it)
-            "citations": [],
-            "suggestions": [f"More detail {ch}.{v}"]
+            "citations": [f"[{ch}:{v}]"],
+            "suggestions": suggestions,
+            "ctx_source": "commentary2" if row.get("commentary2") else ("mixed" if row.get("commentary1") else "none"),
+            "used_commentary2": bool(row.get("commentary2")),
         }
 
-    # ----- Listing queries like "Which verses contain krodha" -----
-    term_for_list = _is_listing_query(q)
-    if term_for_list:
-        verses = _fts_find_verses(conn, term_for_list, limit=20)
-        if not verses:
-            return {"mode": "list", "answer": NO_MATCH_MESSAGE, "citations": [], "suggestions": []}
-
-        # Build plain-text list; include [C:V] to make them clickable in your widget
-        lines: List[str] = []
-        for r in verses:
-            ch, v = int(r["chapter"]), int(r["verse"])
-            title = _clean_text(r.get("title") or "")
-            trans = _clean_text(r.get("translation") or "")
-            block = f"{ch}:{v} — {title}\n{trans}\n[{ch}:{v}]"
-            lines.append(block)
-        answer = "\n\n".join(lines)
+    # 2) More detail on C:V
+    mdetail = re.search(r"\bmore\s+detail\s+on\s+([1-9]|1[0-8])[:\. ](\d{1,3})\b", q, re.I)
+    if mdetail:
+        ch, v = int(mdetail.group(1)), int(mdetail.group(2))
+        row = fetch_exact(conn, ch, v)
+        if not row:
+            return {"answer": NO_MATCH_MESSAGE, "citations": []}
         return {
-            "mode": "list",
-            "answer": answer,
-            "citations": [],  # inline [C:V] makes them clickable already
-            "suggestions": []
+            "mode": "commentary_detail",
+            "chapter": ch,
+            "verse": v,
+            "title": row.get("title") or "",
+            "commentary2": row.get("commentary2") or "",
+            "commentary1": row.get("commentary1") or "",
+            "citations": [f"[{ch}:{v}]"],
+            "ctx_source": "commentary2" if row.get("commentary2") else ("mixed" if row.get("commentary1") else "none"),
+            "used_commentary2": bool(row.get("commentary2")),
         }
 
-    # ----- Single-term queries like "krodha" (define + list) -----
-    term = _is_single_term(q)
+    # 3) Term-style list: “which verses contain …” OR short single/dual-word query
+    term = _looks_like_term_query(q)
     if term:
-        verses = _fts_find_verses(conn, term, limit=20)
-
-        # Short definition from commentary2 context
-        ctx_lines: List[str] = []
-        for r in verses[:8]:
+        # prefer verses where commentary2 mentions the term; fallback to everything
+        q_fts = f'"{term}"'
+        rows = search_fts(conn, q_fts, limit=60)
+        # Build list: 2:63 — <translation…> [2:63]
+        lines: List[str] = []
+        cites: List[str] = []
+        seen = set()
+        for r in rows:
             ch, v = int(r["chapter"]), int(r["verse"])
-            c2 = _clean_text(r.get("commentary2") or "")
-            if c2:
-                snippet = c2 if len(c2) < 320 else c2[:320].rsplit(" ", 1)[0] + "…"
-                ctx_lines.append(f"[{ch}:{v}] {snippet}")
+            key = (ch, v)
+            if key in seen: continue
+            seen.add(key)
+            trans = _clean_text(r.get("translation") or r.get("colloquial") or r.get("roman") or r.get("title") or "")
+            if not trans: continue
+            # keep each item short
+            if len(trans) > 220: trans = trans[:220].rsplit(" ", 1)[0] + "…"
+            lines.append(f"{ch}:{v} — {trans} [{ch}:{v}]")
+            cites.append(f"{ch}:{v}")
+            if len(lines) >= 20: break
+        if not lines:
+            return {"mode": "term_list", "answer": NO_MATCH_MESSAGE, "citations": []}
+        return {
+            "mode": "term_list",
+            "answer": "\n\n".join(lines),
+            "citations": [f"[{c}]" for c in cites[:8]],
+            "ctx_source": "mixed",
+            "used_commentary2": any(_clean_text(r.get("commentary2") or "") for r in rows),
+        }
 
-        definition = ""
-        if ctx_lines:
-            definition = _synthesize_broad_from_c2(f"What does the term '{term}' mean in the Gita? Define briefly.", ctx_lines)
+    # 4) Broad/thematic RAG
+    q_expanded = _expand_query(q)
+    fts_rows = search_fts(conn, q_expanded, limit=24)
 
-        # Verse list (as above)
-        if verses:
-            lines: List[str] = []
-            for r in verses:
-                ch, v = int(r["chapter"]), int(r["verse"])
-                title = _clean_text(r.get("title") or "")
-                trans = _clean_text(r.get("translation") or "")
-                block = f"{ch}:{v} — {title}\n{trans}\n[{ch}:{v}]"
-                lines.append(block)
-            listing = "\n\n".join(lines)
-            answer = (definition + "\n\n" if definition else "") + listing
-            return {
-                "mode": "term",
-                "answer": answer,
-                "citations": [],
-                "suggestions": []
-            }
-        else:
-            return {
-                "mode": "term",
-                "answer": definition or NO_MATCH_MESSAGE,
-                "citations": [],
-                "suggestions": []
-            }
+    emb = None
+    embeddings_used = False
+    if USE_EMBED:
+        try:
+            emb = embed_store.query(q, top_k=6, where={"topic": TOPIC_DEFAULT})
+            embeddings_used = True
+        except Exception as e:
+            print("Embedding query failed:", e)
+            embeddings_used = False
 
-    # ----- Broad/thematic questions: commentary2-only, 2–3 paragraphs -----
-    fts_rows = search_fts(conn, q, limit=24)
-    if not fts_rows:
-        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "suggestions": []}
+    # merge hits (keep FTS order)
+    def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int,int,Dict]]:
+        results: List[Tuple[int,int,Dict]] = []
+        seen = set()
+        for r in fts_rows:
+            key = (int(r["chapter"]), int(r["verse"]))
+            if key in seen: continue
+            seen.add(key); results.append((key[0], key[1], dict(r)))
+        if embed_hits and embed_hits.get("metadatas"):
+            for metas in embed_hits["metadatas"]:
+                for m in metas:
+                    ch = int(m.get("chapter") or 0); v = int(m.get("verse") or 0)
+                    if ch<=0 or v<=0: continue
+                    key = (ch,v)
+                    if key in seen: continue
+                    seen.add(key); results.append((ch,v,m))
+        return results
 
-    # Build context strictly from commentary2
+    merged = _merge_hits(fts_rows, emb or {})
+    if not merged:
+        return {"mode":"broad","answer":NO_MATCH_MESSAGE,"citations":[],"suggestions":[],"embeddings_used":embeddings_used}
+
+    diversified = _diversify_hits(
+        merged, per_chapter=2, max_total=12, neighbor_radius=1, min_distinct_chapters=3
+    )
+
     ctx_lines: List[str] = []
-    cites: List[str] = []
-    seen = set()
-    for r in fts_rows:
-        ch, v = int(r["chapter"]), int(r["verse"])
-        cv = (ch, v)
-        if cv in seen: continue
-        seen.add(cv)
-        c2 = _clean_text(r.get("commentary2") or "")
-        if not c2: continue
-        short = c2 if len(c2) < 480 else c2[:480].rsplit(" ", 1)[0] + "…"
-        ctx_lines.append(f"[{ch}:{v}] {short}")
-        cites.append(f"{ch}:{v}")
-        if len(ctx_lines) >= 10:
-            break
+    cites_unique: List[str] = []
+    chapters_in_ctx: List[str] = []
+    force_source = "commentary2" if RAG_SOURCE == "commentary2" else None
+
+    for ch, v, data in diversified:
+        cv = f"{ch}:{v}"
+        block = _best_text_block(data if isinstance(data, dict) else {}, force_source=force_source)
+        if not block: continue
+        if len(block) > 600: block = block[:600].rsplit(" ", 1)[0] + "…"
+        ctx_lines.append(f"[{cv}] {block}")
+        if cv not in cites_unique: cites_unique.append(cv)
+        chapters_in_ctx.append(str(ch))
+        if len(ctx_lines) >= 10: break
 
     if not ctx_lines:
-        return {"mode": "broad", "answer": NO_MATCH_MESSAGE, "citations": [], "suggestions": []}
+        return {"mode":"broad","answer":NO_MATCH_MESSAGE,"citations":cites_unique[:8],"suggestions":[],"embeddings_used":embeddings_used}
 
-    ans = _synthesize_broad_from_c2(q, ctx_lines)
+    # 2 short paragraphs (not 5–6 sections)
+    ans = _synthesize_two_paras(q, ctx_lines)
+    model_cites = _extract_citations_from_text(ans)
+
+    # merge citations (model first, then retrieved)
+    ordered: List[str] = []
+    seen = set()
+    for c in model_cites + cites_unique:
+        if c in seen: continue
+        seen.add(c); ordered.append(c)
 
     return {
-        "mode": "broad",
+        "mode": "rag",
         "answer": ans if ans else NO_MATCH_MESSAGE,
-        "citations": list(dict.fromkeys(cites))[:8],
-        "suggestions": [f"More detail {q}"]
+        "citations": ordered[:8],
+        "suggestions": ["More detail on " + ordered[0]] if ordered else [],
+        "embeddings_used": embeddings_used,
+        "ctx_source": "commentary2" if RAG_SOURCE == "commentary2" else "mixed",
+        "used_commentary2": any("commentary2" in (line.lower()) for line in ctx_lines),
     }
