@@ -1,14 +1,11 @@
-// Gita Q&A v2 — CLEAN FIX (no duplicate vars) 
-// Version: v2.7 field-queries + suppressCv + title nocites
-// - Natural-language field queries (Sanskrit / English(=roman) / Translation / Word meanings / Commentary).
-// - Title-first layout for field queries, same as Explain.
-// - Suppress redundant top citation pill for the same verse (extras.suppressCv).
-// - Do not turn the title's "2:47" into a clickable pill.
-// - Strip literal "[C:V]" tokens from summary.
-// - No visual UI changes.
+// Gita Q&A v2 — v2.8 (Markdown rendering, no UI changes)
+// - Renders model answers in Markdown (headings, lists, bold/italics, links).
+// - Keeps existing citation pills and inline clickable citations.
+// - Respects 'title' no-citations rule and suppresses redundant top citation pill.
+// - Field-query support unchanged.
 
 const GitaWidget = (() => {
-  console.log('[GW] init v2.7');
+  console.log('[GW] init v2.8');
 
   // ===== Field query addon (no UI changes) =====
   const FIELD_SYNONYMS = {
@@ -78,6 +75,95 @@ const GitaWidget = (() => {
   }
   // =============================================
 
+  // ===== Markdown rendering (safe & tiny) =====
+  function mdEscape(s){
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#39;');
+  }
+  function sanitizeUrl(url) {
+    try {
+      const u = new URL(url, window.location.href);
+      const scheme = u.protocol.toLowerCase();
+      if (scheme === 'http:' || scheme === 'https:') return u.href;
+    } catch(e){}
+    return '#';
+  }
+  function mdInline(s){
+    // links [text](url)
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_,txt,href) => {
+      return `<a href="${sanitizeUrl(href)}" target="_blank" rel="noopener">${mdEscape(txt)}</a>`;
+    });
+    // code `code`
+    s = s.replace(/`([^`]+)`/g, (_,code)=>`<code>${mdEscape(code)}</code>`);
+    // bold **text**
+    s = s.replace(/\*\*([^*]+)\*\*/g, (_,b)=>`<strong>${mdEscape(b)}</strong>`);
+    // italics *text*
+    s = s.replace(/(^|\W)\*([^*]+)\*(?=\W|$)/g, (_,pre,i)=>`${pre}<em>${mdEscape(i)}</em>`);
+    return s;
+  }
+  function mdToHtml(md){
+    const lines = String(md||'').replace(/\r\n?|\u2028|\u2029/g,'\n').split(/\n/);
+    let out = [];
+    let inUL = false, inOL = false;
+    function closeLists(){ if(inUL){ out.push('</ul>'); inUL=false; } if(inOL){ out.push('</ol>'); inOL=false; } }
+    for (let raw of lines){
+      let l = raw.trimEnd();
+      if (!l.trim()){
+        closeLists();
+        out.push('<p></p>');
+        continue;
+      }
+      // headings ###, ##, #
+      let hm = /^(#{1,3})\s+(.*)$/.exec(l);
+      if (hm){
+        closeLists();
+        const level = hm[1].length;
+        out.push(`<h${level}>${mdInline(hm[2])}</h${level}>`);
+        continue;
+      }
+      // ordered list: 1. foo
+      let om = /^\s*\d+\.\s+(.*)$/.exec(l);
+      if (om){
+        if (!inOL){ closeLists(); out.push('<ol>'); inOL=true; }
+        out.push(`<li>${mdInline(om[1])}</li>`);
+        continue;
+      }
+      // unordered list: -, *
+      let um = /^\s*[-*]\s+(.*)$/.exec(l);
+      if (um){
+        if (!inUL){ closeLists(); out.push('<ul>'); inUL=true; }
+        out.push(`<li>${mdInline(um[1])}</li>`);
+        continue;
+      }
+      // blockquote
+      let bq = /^>\s?(.*)$/.exec(l);
+      if (bq){
+        closeLists();
+        out.push(`<blockquote>${mdInline(bq[1])}</blockquote>`);
+        continue;
+      }
+      // paragraph
+      closeLists();
+      out.push(`<p>${mdInline(l)}</p>`);
+    }
+    closeLists();
+    // collapse empty <p></p>
+    return out.join('').replace(/(?:<p>\s*<\/p>)+/g, '');
+  }
+  function renderMarkdown(mdText){
+    const div = document.createElement('div');
+    div.className = 'md';
+    // strip any literal [C:V] tokens (legacy)
+    const cleaned = String(mdText||'').replace(/\[C:V\]/g,'');
+    div.innerHTML = mdToHtml(cleaned);
+    return div;
+  }
+  // ===========================================
+
   function el(tag, attrs = {}, ...children) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -106,7 +192,7 @@ const GitaWidget = (() => {
   function toPlain(text) {
     if (text == null) return '';
     let t = String(text)
-      .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+      .replace(/<\s*br\s*\/?.\s*>/gi, '\n')
       .replace(/<[^>]+>/g, '')
       .replace(/\r\n?|\u2028|\u2029/g, '\n');
     t = t.replace(/&nbsp;/g, ' ')
@@ -237,9 +323,9 @@ const GitaWidget = (() => {
       .gw2 * { box-sizing: border-box; }
       .gw2 { background: var(--c-bg); color: var(--c-fg); border: 1px solid var(--c-border); border-radius: 10px; padding: 12px; }
       .gw2 .log { display: flex; flex-direction: column; gap: 12px; min-height: 38vh; max-height: 65vh; overflow: auto; padding: 8px; background: var(--c-panel); border: 1px solid var(--c-border); border-radius: 8px; }
-      .gw2 .msg { display: block; white-space: pre-wrap; }
+      .gw2 .msg { display: block; white-space: normal; }
       .gw2 .msg .bubble { width: 100%; padding: 0; }
-      .gw2 .msg.user .bubble { background: var(--c-bg); border: 1px solid var(--c-border); padding: 10px 12px; border-radius: 8px; }
+      .gw2 .msg.user .bubble { background: var(--c-bg); border: 1px solid var(--c-border); padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; }
       .gw2 .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
       .gw2 input[type="text"] { flex: 1; padding: 14px; border: 1px solid var(--c-border); border-radius: 10px; background: transparent; color: var(--c-fg); font-size: 18px; }
       .gw2 .clear { padding: 10px 12px; border: 1px solid var(--c-border); background: transparent; border-radius: 8px; cursor: pointer; color: var(--c-fg); }
@@ -263,6 +349,12 @@ const GitaWidget = (() => {
       .gw2 .sect.transl { font-style: italic; }
       .gw2 .wm-inline { margin-top: 12px; }
       .gw2 .wm-key { font-weight: 800; }
+      .gw2 .md h1,.gw2 .md h2,.gw2 .md h3{ margin: .6em 0 .3em; line-height:1.25; }
+      .gw2 .md p{ margin: .5em 0; }
+      .gw2 .md ul,.gw2 .md ol{ margin: .5em 1.25em; }
+      .gw2 .md code{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .95em; padding: .1em .25em; border:1px solid var(--c-border); border-radius:4px; }
+      .gw2 .md a{ color: var(--c-fg); text-decoration: underline; }
+      blockquote{ border-left: 3px solid var(--c-border); padding-left: .75em; color: var(--c-muted); margin: .6em 0; }
     `);
 
     const wrap = el('div', { class: 'gw2' });
@@ -336,29 +428,44 @@ const GitaWidget = (() => {
             bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
           }
 
-          // Commentary sections (when present)
-          if (content.commentary1) {
-            any = true;
-            bubble.appendChild(el('div', { class: 'sect' }, 'Śaṅkara (Commentary 1):'));
-            bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.commentary1)));
-          }
+          // Commentary sections (when present) — use Markdown renderer to allow formatting
           if (content.commentary2) {
             any = true;
-            bubble.appendChild(el('div', { class: 'sect' }, 'Commentary 2:'));
-            bubble.appendChild(el('div', { class: 'sect' }, toPlain(content.commentary2)));
+            const h = el('div', { class: 'sect' }, 'Commentary:');
+            bubble.appendChild(h);
+            const md = renderMarkdown(content.commentary2);
+            md.classList.add('sect');
+            bubble.appendChild(md);
+          }
+          if (content.commentary1) {
+            any = true;
+            const h = el('div', { class: 'sect' }, 'Śaṅkara (Commentary 1):');
+            bubble.appendChild(h);
+            const md = renderMarkdown(content.commentary1);
+            md.classList.add('sect');
+            bubble.appendChild(md);
           }
 
           if (content.summary) {
             any = true;
-            const cleanedSummary = toPlain(String(content.summary).replace(/\[C:V\]/g,''));
-            bubble.appendChild(el('div', { class: 'sect' }, 'Summary: ' + cleanedSummary));
+            const cleanedSummary = String(content.summary).replace(/\[C:V\]/g,'');
+            const md = renderMarkdown('**Summary:** ' + cleanedSummary);
+            md.classList.add('sect');
+            bubble.appendChild(md);
           }
 
           const rest = content.answer;
-          if (!any && rest) bubble.appendChild(el('div', {}, toPlain(rest)));
+          if (!any && rest) {
+            const md = renderMarkdown(rest);
+            md.classList.add('sect');
+            bubble.appendChild(md);
+          }
           if (!any && !rest) bubble.textContent = toPlain(JSON.stringify(content));
         } else {
-          bubble.textContent = toPlain(content);
+          // string answer -> render as Markdown
+          const md = renderMarkdown(String(content||''));
+          md.classList.add('sect');
+          bubble.appendChild(md);
         }
       }
 
