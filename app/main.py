@@ -1,4 +1,4 @@
-# main.py — Gita Q&A v2 (Explain + Definition + Thematic List; safe, UI unchanged)
+# main.py — Gita Q&A v2 (Explain + Definition + Thematic List + Model-only answers; UI unchanged)
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +31,7 @@ NO_MATCH_MESSAGE = os.getenv(
     "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.",
 )
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
-USE_EMBED = os.getenv("USE_EMBED", "0") == "1"
+USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # kept for compatibility
 RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()  # e.g. "commentary2"
 
 # --- OpenAI client ---
@@ -139,7 +139,7 @@ def home():
 <script>
 (function () {
   var s = document.createElement('script');
-  s.src = '/static/widget.js?v=' + Date.now();   // auto cache-buster
+  s.src = '/static/widget.js?v=' + Date.now();
   s.async = true;
   s.onload = function () {
     if (window.GitaWidget && GitaWidget.mount) {
@@ -352,7 +352,32 @@ def _diversify_hits(merged: List[Tuple[int, int, Dict]],
             selected.append((ch, v, data)); per_ch[ch] += 1
     return selected[:max_total]
 
-# --- Structured synthesis (fallback essay; not used for listing/definition) ---
+# --- Model-only answer (fast, nicely formatted, Gita-guarded) ---
+def _model_answer_guarded(question: str, max_tokens: int = 700) -> str:
+    """
+    Lets the model answer directly with its best format, but keeps it inside Gita boundaries.
+    """
+    system = (
+        "You are a Bhagavad Gita tutor. Answer clearly and helpfully, using only the Bhagavad Gita.\n"
+        "Prefer to weave in chapter:verse citations like [2:47] whenever you refer to a verse.\n"
+        "Do not cite or rely on other scriptures or external sources.\n"
+        "Use a natural structure (headings, short paragraphs, lists) in plain text.\n"
+        "If the question is not answerable from the Gita, say so briefly."
+    )
+    prompt = f"Question: {question}\n\nRespond as instructed above."
+    try:
+        rsp = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        return (rsp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+# --- Structured synthesis (fallback essay from retrieved context) ---
 def _synthesize_structured(question: str, ctx_lines: List[str],
                            min_sections: int = 3,
                            max_sections: int = 5,
@@ -412,7 +437,6 @@ async def ask(payload: AskPayload):
         ch, v = cv
         row_r = fetch_exact(conn, ch, v)
         if not row_r:
-            # Friendly 404 for non-existent verse
             return {
                 "mode": "error",
                 "answer": f"Chapter {ch}, Verse {v} does not exist.",
@@ -433,17 +457,21 @@ async def ask(payload: AskPayload):
                 "debug": {"mode": "word_meaning"}
             }
 
-        # Explain with new ordering: WM -> Summary (from commentary2) -> Commentary2 -> Commentary1
+        # Explain — order: WM -> Summary(DB) -> Commentary2 -> Commentary1
         neighbors = [dict(n) for n in fetch_neighbors(conn, ch, v, k=1)]
-        # Build short summary ONLY from commentary2 if available
+
         c2 = _clean_text(row.get("commentary2") or "")
-        summary = ""
-        if c2:
+        db_summary = _clean_text(row.get("summary") or "")  # <-- use DB summary FIRST
+        summary = db_summary
+        generated = False
+        if not summary and c2:
+            # Fallback: synthesize short summary from commentary2 only if DB summary missing
             prompt = (
                 "Summarize the following commentary in 3–5 plain sentences, "
                 "grounded in the text. No markup, no quotes, concise:\n\n" + c2[:3000]
             )
             summary = _summarize(prompt, max_tokens=320)
+            generated = True
 
         resp = {
             "mode": "explain",
@@ -464,68 +492,35 @@ async def ask(payload: AskPayload):
                 for n in neighbors
             ],
             "citations": [f"[{ch}:{v}]"],
-            "debug": {"mode": "explain", "summary_from": "commentary2" if c2 else "none"}
+            "debug": {
+                "mode": "explain",
+                "used_db_summary": bool(db_summary),
+                "summary_fallback_generated": generated
+            }
         }
         return resp
 
-    # ----- Decide broad path: definition vs thematic list vs essay -----
+    # ----- Decide broad path: definition vs verse-list vs model-only essay -----
+    # (We still keep FTS for LIST mode; everything else goes model-only by default.)
     q_expanded = _expand_query(q)
-    fts_rows = search_fts(conn, q_expanded, limit=40)  # a few more for list mode breathing room
+    fts_rows = search_fts(conn, q_expanded, limit=60)  # give list mode some headroom
 
-    # Build merged hits (FTS primary; embeddings optional)
-    emb = None
-    embeddings_used = False
-    if USE_EMBED:
-        try:
-            emb = embed_store.query(q, top_k=8, where={"topic": topic})
-            embeddings_used = True
-        except Exception as e:
-            print("Embedding query failed:", e)
-            embeddings_used = False
-
-    def _merge_hits(fts_rows: List[Dict], embed_hits: Dict) -> List[Tuple[int, int, Dict]]:
-        results: List[Tuple[int, int, Dict]] = []
-        seen = set()
-        for r in fts_rows:
-            key = (int(r["chapter"]), int(r["verse"]))
-            if key in seen: continue
-            seen.add(key); results.append((key[0], key[1], dict(r)))
-        if embed_hits and embed_hits.get("metadatas"):
-            for metas in embed_hits["metadatas"]:
-                for m in metas:
-                    ch = int(m.get("chapter") or 0)
-                    v = int(m.get("verse") or 0)
-                    if ch <= 0 or v <= 0: continue
-                    key = (ch, v)
-                    if key in seen: continue
-                    seen.add(key); results.append((ch, v, m))
-        return results
-
-    merged = _merge_hits(fts_rows, emb or {})
-    if not merged:
-        return {
-            "mode": "broad",
-            "answer": NO_MATCH_MESSAGE,
-            "citations": [],
-            "suggestions": [],
-            "embeddings_used": embeddings_used,
-            "debug": {"mode": "none", "reason": "no_hits"}
-        }
-
-    # Thematic LIST mode?
+    # LIST mode?
     if _is_verses_listing_query(q):
-        diversified = _diversify_hits(merged, per_chapter=2, max_total=20, neighbor_radius=1, min_distinct_chapters=3)
+        diversified = _diversify_hits(
+            [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows],
+            per_chapter=2, max_total=20, neighbor_radius=1, min_distinct_chapters=3
+        )
         lines: List[str] = []
         cites: List[str] = []
         for ch, v, data in diversified[:20]:
             row = dict(data)
             title = _clean_text(row.get("title") or "")
             trans = _clean_text(row.get("translation") or row.get("roman") or row.get("colloquial") or "")
-            if trans:
-                if len(trans) > 220:
-                    trans = trans[:220].rsplit(" ", 1)[0] + "…"
+            if trans and len(trans) > 220:
+                trans = trans[:220].rsplit(" ", 1)[0] + "…"
             label = f"{ch}:{v}"
-            # Plain text (widget strips HTML) — title first then translation; citation keeps clickable.
+            # Title first, then translation; widget will render [C:V] clickable pill
             line = f"{title} — {trans} [{label}]".strip()
             lines.append(line)
             cites.append(label)
@@ -535,92 +530,111 @@ async def ask(payload: AskPayload):
             "answer": answer,
             "citations": [f"[{c}]" for c in cites[:8]],
             "suggestions": ["More detail"] + ([f"Explain {c}" for c in cites[:3]] if cites else []),
-            "embeddings_used": embeddings_used,
+            "embeddings_used": False,
             "debug": {"mode": "thematic_list", "items": len(lines)}
         }
 
-    # Definition mode? (short & fast, commentary2 only if possible)
+    # DEFINITION mode? (short terms like “sthita prajna”, “krodha”)
     if _is_definition_query(q) or (len(q.split()) <= 3):
-        # choose top few hits that actually have commentary2
-        picks: List[Tuple[int, int, Dict]] = []
-        for ch, v, data in merged:
-            row = dict(data)
-            if _clean_text(row.get("commentary2") or ""):
-                picks.append((ch, v, row))
-            if len(picks) >= 6:
-                break
-        if not picks:
-            picks = [(ch, v, dict(d)) for ch, v, d in merged[:6]]
-
-        ctx_lines: List[str] = []
-        cites: List[str] = []
-        for ch, v, row in picks:
-            block = _clean_text(row.get("commentary2") or row.get("translation") or row.get("roman") or "")
-            if not block: continue
-            if len(block) > 500:
-                block = block[:500].rsplit(" ", 1)[0] + "…"
-            ctx_lines.append(f"[{ch}:{v}] {block}")
-            cites.append(f"{ch}:{v}")
-
-        prompt = (
-            "Using ONLY the provided context, give a concise 1–2 paragraph definition/explanation in plain text. "
-            "Include 2–3 inline citations like [chapter:verse] where relevant.\n\nContext:\n" +
-            "\n".join(ctx_lines)
+        # Use model directly (fast) but ask it to include 2–3 citations
+        system = (
+            "You are a Bhagavad Gita tutor. Define the term from the Gita only. "
+            "Include 2–3 inline verse citations like [chapter:verse] where relevant."
         )
-        ans = _summarize(prompt, max_tokens=300) or NO_MATCH_MESSAGE
+        prompt = f"Define briefly and clearly: {q}"
+        try:
+            rsp = client.chat.completions.create(
+                model=GEN_MODEL,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=380,
+            )
+            ans = (rsp.choices[0].message.content or "").strip()
+        except Exception:
+            ans = ""
+
+        # Pull out any [C:V] to surface pills
+        cites = _extract_citations_from_text(ans)
         return {
             "mode": "definition",
-            "answer": ans,
-            "citations": [f"[{c}]" for c in list(dict.fromkeys(cites))[:8]],
+            "answer": ans if ans else NO_MATCH_MESSAGE,
+            "citations": [f"[{c}]" for c in cites[:8]],
             "suggestions": ["More detail", "Show related verses"],
-            "embeddings_used": embeddings_used,
-            "debug": {"mode": "definition", "ctx_blocks": len(ctx_lines)}
+            "embeddings_used": False,
+            "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
         }
 
-    # Otherwise: essay-style RAG (kept, but tuned shorter)
-    diversified = _diversify_hits(merged, per_chapter=2, max_total=12, neighbor_radius=1, min_distinct_chapters=3)
-    ctx_lines: List[str] = []
-    cites_unique: List[str] = []
-    chapters_in_ctx: List[str] = []
-    force_source = "commentary2" if RAG_SOURCE == "commentary2" else None
+    # MODEL-ONLY essay/explanation (default for thematic questions now)
+    ans = _model_answer_guarded(q, max_tokens=700)
+    if not ans:
+        # Fallback to retrieved essay if model call fails
+        merged = [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows]
+        if not merged:
+            return {
+                "mode": "broad",
+                "answer": NO_MATCH_MESSAGE,
+                "citations": [],
+                "suggestions": [],
+                "embeddings_used": False,
+                "debug": {"mode": "none", "reason": "no_hits"}
+            }
 
-    for ch, v, data in diversified:
-        row = dict(data)
-        block = _best_text_block(row, force_source=force_source)
-        if not block:
-            continue
-        if len(block) > 600:
-            block = block[:600].rsplit(" ", 1)[0] + "…"
-        ctx_lines.append(f"[{ch}:{v}] {block}")
-        cites_unique.append(f"{ch}:{v}")
-        chapters_in_ctx.append(str(ch))
-        if len(ctx_lines) >= 10:
-            break
+        diversified = _diversify_hits(merged, per_chapter=2, max_total=12, neighbor_radius=1, min_distinct_chapters=3)
+        ctx_lines: List[str] = []
+        cites_unique: List[str] = []
+        chapters_in_ctx: List[str] = []
+        force_source = "commentary2" if RAG_SOURCE == "commentary2" else None
 
-    if not ctx_lines:
+        for ch, v, data in diversified:
+            row = dict(data)
+            block = _best_text_block(row, force_source=force_source)
+            if not block:
+                continue
+            if len(block) > 600:
+                block = block[:600].rsplit(" ", 1)[0] + "…"
+            ctx_lines.append(f"[{ch}:{v}] {block}")
+            cites_unique.append(f"{ch}:{v}")
+            chapters_in_ctx.append(str(ch))
+            if len(ctx_lines) >= 10:
+                break
+
+        if not ctx_lines:
+            return {
+                "mode": "broad",
+                "answer": NO_MATCH_MESSAGE,
+                "citations": [],
+                "suggestions": [],
+                "embeddings_used": False,
+                "debug": {"mode": "broad", "reason": "no_ctx"}
+            }
+
+        ans = _synthesize_structured(q, ctx_lines, min_sections=3, max_sections=4,
+                                     target_words_low=350, target_words_high=450,
+                                     enforce_diversity_hint=chapters_in_ctx)
+        model_cites = _extract_citations_from_text(ans)
+        ordered: List[str] = []
+        seen = set()
+        for c in model_cites + cites_unique:
+            if c in seen: continue
+            seen.add(c); ordered.append(c)
+
         return {
-            "mode": "broad",
-            "answer": NO_MATCH_MESSAGE,
-            "citations": [],
-            "suggestions": [],
-            "embeddings_used": embeddings_used,
-            "debug": {"mode": "broad", "reason": "no_ctx"}
+            "mode": "rag",
+            "answer": ans if ans else NO_MATCH_MESSAGE,
+            "citations": [f"[{c}]" for c in ordered[:8]],
+            "suggestions": _make_dynamic_suggestions(q, ordered[:5]),
+            "embeddings_used": False,
+            "debug": {"mode": "rag_fallback", "rag_source": RAG_SOURCE or "mixed"}
         }
 
-    ans = _synthesize_structured(q, ctx_lines, min_sections=3, max_sections=4, target_words_low=350, target_words_high=450,
-                                 enforce_diversity_hint=chapters_in_ctx)
-    model_cites = _extract_citations_from_text(ans)
-    ordered: List[str] = []
-    seen = set()
-    for c in model_cites + cites_unique:
-        if c in seen: continue
-        seen.add(c); ordered.append(c)
-
+    # Happy path: model-only thematic answer
+    cites = _extract_citations_from_text(ans)
     return {
-        "mode": "rag",
-        "answer": ans if ans else NO_MATCH_MESSAGE,
-        "citations": [f"[{c}]" for c in ordered[:8]],
-        "suggestions": _make_dynamic_suggestions(q, ordered[:5]),
-        "embeddings_used": embeddings_used,
-        "debug": {"mode": "rag", "rag_source": RAG_SOURCE or "mixed"}
+        "mode": "model_only",
+        "answer": ans,
+        "citations": [f"[{c}]" for c in cites[:8]],
+        "suggestions": _make_dynamic_suggestions(q, cites[:5]),
+        "embeddings_used": False,
+        "debug": {"mode": "model_only"}
     }
