@@ -2,36 +2,43 @@
 import os, sqlite3
 DB_PATH = os.environ.get("DB_PATH", "/data/gita.db")
 
-ANSWERS = {
-  "What does the Gītā mean by surrender to the Lord?": {
-    "short": (
-      "Surrender (*śaraṇāgati*) is entrusting oneself wholly to Krishna—"
-      "releasing the ego’s claim of control and relying on divine grace. "
-      "It culminates in the assurance of freedom in [18:66] and the promise of care in [9:22]."
-    ),
-    "medium": (
-      "The Gītā treats surrender not as passivity but as clear, active trust. Krishna’s climactic instruction—"
-      "“Abandon all dharmas and take refuge in Me alone; I will liberate you from all sins; do not grieve” [18:66]—"
-      "invites Arjuna to lay down the burden of doership while still acting. Earlier He promises to safeguard those who "
-      "are steadfast in devotion: “I carry what they lack and preserve what they have” [9:22]. "
-      "This path is radically inclusive: even those seen as fallen are lifted when devotion is firm [9:31–32]."
-    ),
-    "long": (
-      "### In one line\n"
-      "Entrust everything to the Divine and act freely—grace carries what the ego cannot.  \n\n"
-      "### Where Krishna says it\n"
-      "- Final call to refuge: **“Take refuge in Me alone”** — [18:66]  \n"
-      "- Assurance of protection: **“I carry what they lack…”** — [9:22]  \n"
-      "- Radical inclusivity: **all who turn to Him are uplifted** — [9:31–32]\n\n"
-      "### How to live it\n"
-      "- Begin tasks with an inner offering and end them the same way.  \n"
-      "- When anxiety rises, remember the pledges in [18:66] and [9:22].  \n"
-      "- Keep acting, but place outcomes at the Lord’s feet.  \n\n"
-      "### Why it matters\n"
-      "Surrender resolves the strain between effort and control. "
-      "It cuts the root of bondage (egoic doership) and opens the heart to peace and liberation."
-    )
-  },
+ANSWERS["What does the Gītā mean by surrender to the Lord?"] = {
+  "short": (
+    "Surrender (*śaraṇāgati*) is entrusting oneself wholly to Krishna—"
+    "laying down egoic doership and relying on grace while still acting. "
+    "Krishna’s pledge of refuge [18:66] and providential care [9:22] anchor this path; "
+    "He welcomes all who turn to Him [9:31–32]."
+  ),
+  "medium": (
+    "In the Gītā, surrender is not passivity but decisive trust. Krishna’s climactic call—"
+    "“take refuge in Me alone; I will liberate you; do not grieve” [18:66]—"
+    "resolves the tension between effort and control: act, but let go of ownership of results. "
+    "Earlier He promises to carry what devotees lack and preserve what they have [9:22]; "
+    "the door is open to everyone who turns to Him in faith [9:31–32]. "
+    "For those still growing, He outlines a graded practice: fix the mind on Him; if not, practice; "
+    "if not, work for His sake; if not, renounce the fruits [12:8–12]."
+  ),
+  "long": (
+    "### What surrender is (and isn’t)\n"
+    "Surrender (*śaraṇāgati*) is wholehearted refuge in the Divine. It is **not** inaction; "
+    "it is acting fully while laying down the ego’s claim of “I am the doer.” "
+    "Krishna’s final assurance—**“Take refuge in Me alone; I will free you from all sin; do not grieve.”** [18:66]—"
+    "is the heart of the teaching.\n\n"
+    "### Core verses to start with\n"
+    "- **[18:66]** — Final instruction: complete refuge and fearlessness.  \n"
+    "- **[9:22]** — “I carry what they lack and preserve what they have”: providence for the surrendered.  \n"
+    "- **[9:31–32]** — Inclusivity: whoever turns to Him is uplifted.\n\n"
+    "### A graded way into surrender (for everyday life)\n"
+    "- **[12:8]**: Keep the mind fixed in Him.  \n"
+    "- **[12:9]**: If not, keep practicing remembrance.  \n"
+    "- **[12:10]**: If not, **work for His sake.**  \n"
+    "- **[12:11–12]**: If not, **give up the fruits**—start with outcome-letting-go.\n\n"
+    "### Living the teaching\n"
+    "- Begin and end tasks with an inner offering.  \n"
+    "- When anxiety spikes, recall the pledges of **[18:66]** and **[9:22]**.  \n"
+    "- Keep acting skillfully, but place results at His feet; peace follows as bondage to outcomes loosens."
+  )
+},
 
   "How can one practice surrender in daily life?": {
     "short": (
