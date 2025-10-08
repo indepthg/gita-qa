@@ -1,0 +1,9 @@
+name: Ready to Deploy
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  ready:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Ready for deployment"
