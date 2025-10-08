@@ -537,11 +537,10 @@ async def ask(payload: AskPayload):
         neighbors = [dict(n) for n in fetch_neighbors(conn, ch, v, k=1)]
 
         c2 = _clean_text(row.get("commentary2") or "")
-        db_summary = _clean_text(row.get("summary") or "")  # <-- use DB summary FIRST
+        db_summary = _clean_text(row.get("summary") or "")
         summary = db_summary
         generated = False
         if not summary and c2:
-            # Fallback: synthesize short summary from commentary2 only if DB summary missing
             prompt = (
                 "Summarize the following commentary in 3–5 plain sentences, "
                 "grounded in the text. No markup, no quotes, concise:\n\n" + c2[:3000]
@@ -549,7 +548,7 @@ async def ask(payload: AskPayload):
             summary = _summarize(prompt, max_tokens=320)
             generated = True
 
-        resp = {
+        return {
             "mode": "explain",
             "chapter": ch,
             "verse": v,
@@ -574,10 +573,9 @@ async def ask(payload: AskPayload):
                 "summary_fallback_generated": generated
             }
         }
-        return resp
 
     # ===================== CANONICAL Q→A (FAST PATH) =====================
-    # Check canonical cache BEFORE list/definition/model for instant responses.
+    # Run this BEFORE list/definition/model so seeded topics are instant.
     try:
         hit = []
         # Prefer FTS table if present
@@ -595,6 +593,7 @@ async def ask(payload: AskPayload):
             pass
 
         if not hit:
+            # Fallback to LIKE (fast enough on small table)
             cur = conn.execute("""
                 SELECT id, micro_topic_id, intent, priority, question_text
                 FROM questions
@@ -625,7 +624,7 @@ async def ask(payload: AskPayload):
                     parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
                 body = "\n".join(parts).strip()
 
-                # Normalize “Chapter 18, Verse 66” → [18:66] (just in case)
+                # Normalize “Chapter 18, Verse 66” → [18:66] just in case
                 body = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
 
                 cites = _extract_citations_from_text(body)
@@ -644,9 +643,8 @@ async def ask(payload: AskPayload):
     # =================== END CANONICAL FAST PATH ===================
 
     # ----- Decide broad path: definition vs verse-list vs model-only essay -----
-    # (We still keep FTS for LIST mode; everything else goes model-only by default.)
     q_expanded = _expand_query(q)
-    fts_rows = search_fts(conn, q_expanded, limit=60)  # give list mode some headroom
+    fts_rows = search_fts(conn, q_expanded, limit=60)
 
     # LIST mode?
     if _is_verses_listing_query(q):
@@ -663,8 +661,7 @@ async def ask(payload: AskPayload):
             if trans and len(trans) > 220:
                 trans = trans[:220].rsplit(" ", 1)[0] + "…"
             label = f"{ch}:{v}"
-            line = f"{title} — {trans} [{label}]".strip()
-            lines.append(line)
+            lines.append(f"{title} — {trans} [{label}]".strip())
             cites.append(label)
         answer = "\n\n".join(lines) if lines else NO_MATCH_MESSAGE
         return {
@@ -676,7 +673,7 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "thematic_list", "items": len(lines)}
         }
 
-    # DEFINITION mode? (short terms like “sthita prajna”, “krodha”)
+    # DEFINITION mode (kept, but now AFTER canonical so it won't steal “sthita prajna”)
     if _is_definition_query(q) or (len(q.split()) <= 3):
         system = (
             "You are a Bhagavad Gita tutor. Define the term from the Gita only. "
@@ -694,7 +691,6 @@ async def ask(payload: AskPayload):
             ans = (rsp.choices[0].message.content or "").strip()
         except Exception:
             ans = ""
-
         cites = _extract_citations_from_text(ans)
         return {
             "mode": "definition",
@@ -705,10 +701,9 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
         }
 
-    # MODEL-ONLY essay/explanation (default for thematic questions now)
+    # MODEL-ONLY essay/explanation (unchanged)
     ans = _model_answer_guarded(q, max_tokens=700)
     if not ans:
-        # Fallback to retrieved essay if model call fails
         merged = [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows]
         if not merged:
             return {
@@ -768,7 +763,6 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "rag_fallback", "rag_source": RAG_SOURCE or "mixed"}
         }
 
-    # Happy path: model-only thematic answer
     cites = _extract_citations_from_text(ans)
     return {
         "mode": "model_only",
