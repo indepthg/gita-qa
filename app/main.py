@@ -1,6 +1,7 @@
-# main.py — Gita Q&A v2 (Explain + Definition + Thematic List + Model-only answers; UI unchanged) Testing
+# app/main.py — Gita Q&A v2 (canonical-first, FTS-aware)
 import os
 import re
+import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
@@ -21,9 +22,9 @@ from .db import (
     ensure_fts,
 )
 from .ingest import load_sheet_to_rows, ingest_commentary
-from . import embed_store
+from . import embed_store  # kept for compatibility
 
-# --- Environment ---
+# --- Environment / constants ---
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
 GEN_MODEL = os.getenv("GEN_MODEL", "gpt-4o-mini")
 NO_MATCH_MESSAGE = os.getenv(
@@ -31,8 +32,9 @@ NO_MATCH_MESSAGE = os.getenv(
     "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.",
 )
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
-USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # kept for compatibility
-RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()  # e.g. "commentary2"
+USE_EMBED = os.getenv("USE_EMBED", "0") == "1"
+RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()
+DB_PATH = os.getenv("DB_PATH", "/data/gita.db")  # <- safe default for Railway volume
 
 # --- OpenAI client ---
 from openai import OpenAI
@@ -218,6 +220,7 @@ async def suggest():
         ]
     }
 
+# Inspect canonical rows quickly
 @app.get("/qa/debug-canonical")
 def debug_canonical(q: str):
     conn = get_conn()
@@ -345,118 +348,89 @@ def _expand_query(q: str) -> str:
     q2 = q + " OR " + " OR ".join(dict.fromkeys(terms))
     return q2
 
-def _db_rows(sql, params=()):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    cur = con.execute(sql, params)
-    out = [dict(r) for r in cur.fetchall()]
-    con.close()
-    return out
+# --- Canonical matching helpers (FTS-friendly) ---
+def _fts_query_from_user(text: str) -> str:
+    toks = re.findall(r"[A-Za-z0-9]+", (text or "").lower())
+    if not toks:
+        return ""
+    seen = set(); uniq = []
+    for t in toks:
+        if t in seen: 
+            continue
+        seen.add(t); uniq.append(t)
+    return " OR ".join(uniq)
 
-# very tolerant detector: "2.47", "2:47", "chapter 2 verse 47"
-_V_RE = re.compile(r'(?:^|\D)(\d{1,2})\s*[:.\-]\s*(\d{1,3})(?:\D|$)', re.I)
-def detect_cv(q: str):
-    if not q: return None
-    m = _V_RE.search(q)
-    if m:
-        ch, v = int(m.group(1)), int(m.group(2))
-        if 1 <= ch <= 18 and 1 <= v <= 200: return ch, v
-    m = re.search(r'chapter\s*(\d{1,2})\D+verse\s*(\d{1,3})', q, re.I)
-    if m:
-        ch, v = int(m.group(1)), int(m.group(2))
-        if 1 <= ch <= 18 and 1 <= v <= 200: return ch, v
-    return None
+def _canonical_lookup(conn: sqlite3.Connection, user_q: str):
+    """Return (qrow, ans_rows) or (None, None). Prefer FTS; alias; then LIKE."""
+    # 1) FTS on questions (requires migrate.py to create questions_fts)
+    q_match = _fts_query_from_user(user_q)
+    if q_match:
+        try:
+            cur = conn.execute("""
+              SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
+              FROM questions_fts
+              JOIN questions q ON q.id = questions_fts.rowid
+              WHERE questions_fts MATCH ?
+              ORDER BY bm25(questions_fts) ASC, q.priority ASC
+              LIMIT 1
+            """, (q_match,))
+            hit = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            hit = []
+        if hit:
+            qrow = hit[0]
+            cur = conn.execute("""
+              SELECT length_tier, answer_text
+              FROM answers
+              WHERE question_id=?
+              ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+            """, (qrow["id"],))
+            return qrow, [dict(r) for r in cur.fetchall()]
 
-def qa_find_canonical(q: str):
-    """Return (question_row, answers_rows) or (None, None)."""
-    # Try FTS5 first (if you added questions_fts); otherwise fallback to LIKE
-    try:
-        hit = _db_rows("""
-            SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
-            FROM questions_fts
-            JOIN questions q ON q.id = questions_fts.rowid
-            WHERE questions_fts MATCH ?
-            ORDER BY bm25(questions_fts) ASC, q.priority ASC
-            LIMIT 1
-        """, (q, ))
-    except Exception:
-        hit = []
-    if not hit:
-        hit = _db_rows("""
-            SELECT id, micro_topic_id, intent, priority, question_text
-            FROM questions
-            WHERE question_text LIKE '%'||?||'%'
-            ORDER BY priority ASC, id ASC
-            LIMIT 1
-        """, (q, ))
-    if not hit:
-        return None, None
-    qrow = hit[0]
-    ans = _db_rows("""
-        SELECT length_tier, answer_text
-        FROM answers
-        WHERE question_id=?
-        ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
-    """, (qrow["id"],))
-    return qrow, ans
+    # 2) Alias table fallback (populated in migrate)
+    cur = conn.execute("""
+      SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
+      FROM question_aliases qa
+      JOIN questions q ON q.id = qa.question_id
+      WHERE LOWER(qa.alias) = LOWER(?)
+      LIMIT 1
+    """, (user_q.strip(),))
+    hit = [dict(r) for r in cur.fetchall()]
+    if hit:
+        qrow = hit[0]
+        cur = conn.execute("""
+          SELECT length_tier, answer_text FROM answers
+          WHERE question_id=?
+          ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+        """, (qrow["id"],))
+        return qrow, [dict(r) for r in cur.fetchall()]
 
-def qa_answers_to_markdown(qrow, ans_rows):
-    """Combine short/medium/long into one Markdown blob (preserves your widget)."""
-    by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
-    parts = []
-    if 'short' in by_tier:
-        parts.append(f"### Short\n{by_tier['short']}")
-    if 'medium' in by_tier:
-        parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
-    if 'long' in by_tier:
-        parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
-    body = "\n".join(parts).strip()
-    # Let widget find verse chips like [2:55]
-    return {
-        "answer": body,
-        "summary": "",           # optional; you can fill later
-        "suggestions": [],       # widget can display pills if you add any
-        "citations": []          # no external links; verse chips are inline
-    }
+    # 3) Last-resort LIKE
+    cur = conn.execute("""
+      SELECT id, micro_topic_id, intent, priority, question_text
+      FROM questions
+      WHERE LOWER(question_text) LIKE '%'||LOWER(?)||'%'
+      ORDER BY priority ASC, id ASC
+      LIMIT 1
+    """, (user_q,))
+    hit = [dict(r) for r in cur.fetchall()]
+    if hit:
+        qrow = hit[0]
+        cur = conn.execute("""
+          SELECT length_tier, answer_text FROM answers
+          WHERE question_id=?
+          ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+        """, (qrow["id"],))
+        return qrow, [dict(r) for r in cur.fetchall()]
 
+    return None, None
 
-# --- Retrieval diversification ---
-def _diversify_hits(merged: List[Tuple[int, int, Dict]],
-                    per_chapter: int = 2,
-                    max_total: int = 10,
-                    neighbor_radius: int = 1,
-                    min_distinct_chapters: int = 3) -> List[Tuple[int, int, Dict]]:
-    selected: List[Tuple[int, int, Dict]] = []
-    per_ch = defaultdict(int)
-    def is_neighbor(ch: int, v: int) -> bool:
-        for (sch, sv, _) in selected:
-            if ch == sch and abs(v - sv) <= neighbor_radius:
-                return True
-        return False
-    for ch, v, data in merged:
-        if len(selected) >= max_total: break
-        if per_ch[ch] >= per_chapter: continue
-        if is_neighbor(ch, v): continue
-        selected.append((ch, v, data)); per_ch[ch] += 1
-    if len({ch for ch, _, _ in selected}) < min_distinct_chapters:
-        for ch, v, data in merged:
-            if len(selected) >= max_total: break
-            if per_ch[ch] >= per_chapter: continue
-            if any((ch == sch and v == sv) for sch, sv, _ in selected): continue
-            selected.append((ch, v, data)); per_ch[ch] += 1
-    return selected[:max_total]
-
-# --- Model-only answer (fast, nicely formatted, Gita-guarded) ---
 def _model_answer_guarded(question: str, max_tokens: int = 700) -> str:
-    """
-    Lets the model answer directly with its best format, but keeps it inside Gita boundaries.
-    """
+    """Let the model answer directly in a Gita-bounded style."""
     system = (
         "You are a Bhagavad Gita tutor. Answer clearly and helpfully, using only the Bhagavad Gita.\n"
         "Prefer to weave in chapter:verse citations like [2:47] whenever you refer to a verse.\n"
-        "Do not cite or rely on other scriptures or external sources.\n"
-        "Use a natural structure (headings, short paragraphs, lists) in plain text.\n"
-        "If the question is not answerable from the Gita, say so briefly."
+        "Use a natural structure (headings, short paragraphs, lists) in plain text."
     )
     prompt = f"Question: {question}\n\nRespond as instructed above."
     try:
@@ -471,12 +445,9 @@ def _model_answer_guarded(question: str, max_tokens: int = 700) -> str:
     except Exception:
         return ""
 
-# --- Structured synthesis (fallback essay from retrieved context) ---
 def _synthesize_structured(question: str, ctx_lines: List[str],
-                           min_sections: int = 3,
-                           max_sections: int = 5,
-                           target_words_low: int = 350,
-                           target_words_high: int = 450,
+                           min_sections: int = 3, max_sections: int = 5,
+                           target_words_low: int = 350, target_words_high: int = 450,
                            enforce_diversity_hint: Optional[List[str]] = None) -> str:
     ctx = "\n".join(ctx_lines)[:8000]
     diversity_hint = ""
@@ -487,7 +458,7 @@ def _synthesize_structured(question: str, ctx_lines: List[str],
         )
     prompt = (
         "You are a Bhagavad Gita assistant. Use ONLY the Context below.\n"
-        f"Write a structured answer with {min_sections}–{max_sections} thematic sections.\n"
+        f"Write a structured answer with {min_sections}–{max_sections} sections.\n"
         "- 2–4 sentences each, plain text, with [chapter:verse] citations where used.\n"
         f"- Total ≈ {target_words_low}–{target_words_high} words.\n"
         "- Use only context; do not invent sources.\n"
@@ -507,11 +478,9 @@ def _synthesize_structured(question: str, ctx_lines: List[str],
             max_tokens=800,
         )
         return (rsp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print("LLM synth failed:", e)
+    except Exception:
         return ""
 
-# ---------- /ask ----------
 # ---------- /ask ----------
 class AskPayload(BaseModel):
     question: str
@@ -552,17 +521,16 @@ async def ask(payload: AskPayload):
                 "debug": {"mode": "word_meaning"}
             }
 
-        # Explain — order: WM -> Summary(DB) -> Commentary2 -> Commentary1
+        # Explain — WM -> DB summary -> synth from commentary2
         neighbors = [dict(n) for n in fetch_neighbors(conn, ch, v, k=1)]
-
         c2 = _clean_text(row.get("commentary2") or "")
         db_summary = _clean_text(row.get("summary") or "")
         summary = db_summary
         generated = False
         if not summary and c2:
             prompt = (
-                "Summarize the following commentary in 3–5 plain sentences, "
-                "grounded in the text. No markup, no quotes, concise:\n\n" + c2[:3000]
+                "Summarize the following commentary in 3–5 plain sentences, grounded in the text. "
+                "No markup, no quotes, concise:\n\n" + c2[:3000]
             )
             summary = _summarize(prompt, max_tokens=320)
             generated = True
@@ -586,75 +554,32 @@ async def ask(payload: AskPayload):
                 for n in neighbors
             ],
             "citations": [f"[{ch}:{v}]"],
-            "debug": {
-                "mode": "explain",
-                "used_db_summary": bool(db_summary),
-                "summary_fallback_generated": generated
-            }
+            "debug": {"mode": "explain", "used_db_summary": bool(db_summary), "summary_fallback_generated": generated}
         }
 
     # ===================== CANONICAL Q→A (FAST PATH) =====================
-    # IMPORTANT: this must run BEFORE list/definition/model
     try:
-        hit = []
-        # Prefer FTS table if present
-        try:
-            cur = conn.execute("""
-                SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
-                FROM questions_fts
-                JOIN questions q ON q.id = questions_fts.rowid
-                WHERE questions_fts MATCH ?
-                ORDER BY bm25(questions_fts) ASC, q.priority ASC
-                LIMIT 1
-            """, (q,))
-            hit = [dict(r) for r in cur.fetchall()]
-        except Exception:
-            pass
-
-        if not hit:
-            # Fallback to LIKE on questions
-            cur = conn.execute("""
-                SELECT id, micro_topic_id, intent, priority, question_text
-                FROM questions
-                WHERE question_text LIKE '%'||?||'%'
-                ORDER BY priority ASC, id ASC
-                LIMIT 1
-            """, (q,))
-            hit = [dict(r) for r in cur.fetchall()]
-
-        if hit:
-            qrow = hit[0]
-            cur = conn.execute("""
-                SELECT length_tier, answer_text
-                FROM answers
-                WHERE question_id=?
-                ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
-            """, (qrow["id"],))
-            ans_rows = [dict(r) for r in cur.fetchall()]
-
-            if ans_rows:
-                by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
-                parts: List[str] = []
-                if 'short' in by_tier:  parts.append(f"### Short\n{by_tier['short']}")
-                if 'medium' in by_tier: parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
-                if 'long' in by_tier:   parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
-                body = "\n".join(parts).strip()
-
-                # Normalize any “Chapter 18, Verse 66” → [18:66]
-                body = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
-
-                cites = _extract_citations_from_text(body)
-                return {
-                    "mode": "canonical",
-                    "matched_question": qrow.get("question_text"),
-                    "answer": body,
-                    "citations": [f"[{c}]" for c in cites[:8]],
-                    "suggestions": _make_dynamic_suggestions(q, cites[:5]),
-                    "embeddings_used": False,
-                    "debug": {"mode": "canonical", "qid": qrow["id"]}
-                }
+        qrow, ans_rows = _canonical_lookup(conn, q)
+        if qrow and ans_rows:
+            by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
+            parts: List[str] = []
+            if 'short' in by_tier:  parts.append(f"### Short\n{by_tier['short']}")
+            if 'medium' in by_tier: parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
+            if 'long' in by_tier:   parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
+            body = "\n".join(parts).strip()
+            # Normalize any “Chapter 18, Verse 66” → [18:66] (defensive)
+            body = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
+            cites = _extract_citations_from_text(body)
+            return {
+                "mode": "canonical",
+                "matched_question": qrow.get("question_text"),
+                "answer": body,
+                "citations": [f"[{c}]" for c in cites[:8]],
+                "suggestions": _make_dynamic_suggestions(q, cites[:5]),
+                "embeddings_used": False,
+                "debug": {"mode": "canonical", "qid": qrow["id"]}
+            }
     except Exception:
-        # If canonical lookup errors for any reason, continue gracefully.
         pass
     # =================== END CANONICAL FAST PATH ===================
 
@@ -717,7 +642,7 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
         }
 
-    # MODEL-ONLY essay/explanation (unchanged)
+    # MODEL-ONLY essay/explanation
     ans = _model_answer_guarded(q, max_tokens=700)
     if not ans:
         merged = [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows]
