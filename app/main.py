@@ -218,6 +218,25 @@ async def suggest():
         ]
     }
 
+@app.get("/qa/debug-canonical")
+def debug_canonical(q: str):
+    conn = get_conn()
+    cur = conn.execute("""
+      SELECT id, question_text FROM questions
+      WHERE question_text LIKE '%'||?||'%'
+      ORDER BY id
+    """, (q,))
+    qs = [dict(r) for r in cur.fetchall()]
+    out = {}
+    for qrow in qs:
+        cur = conn.execute("""
+          SELECT length_tier, substr(answer_text,1,120) AS preview
+          FROM answers WHERE question_id=?
+          ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+        """, (qrow["id"],))
+        out[qrow["id"]] = {"question": qrow["question_text"], "answers": [dict(r) for r in cur.fetchall()]}
+    return out
+
 # ---------- Helpers ----------
 RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
 CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
