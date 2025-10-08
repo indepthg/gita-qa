@@ -493,6 +493,7 @@ def _synthesize_structured(question: str, ctx_lines: List[str],
         return ""
 
 # ---------- /ask ----------
+# ---------- /ask ----------
 class AskPayload(BaseModel):
     question: str
     topic: Optional[str] = None
@@ -575,76 +576,11 @@ async def ask(payload: AskPayload):
         }
         return resp
 
-    # ----- Decide broad path: definition vs verse-list vs model-only essay -----
-    # (We still keep FTS for LIST mode; everything else goes model-only by default.)
-    q_expanded = _expand_query(q)
-    fts_rows = search_fts(conn, q_expanded, limit=60)  # give list mode some headroom
-
-    # LIST mode?
-    if _is_verses_listing_query(q):
-        diversified = _diversify_hits(
-            [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows],
-            per_chapter=2, max_total=20, neighbor_radius=1, min_distinct_chapters=3
-        )
-        lines: List[str] = []
-        cites: List[str] = []
-        for ch, v, data in diversified[:20]:
-            row = dict(data)
-            title = _clean_text(row.get("title") or "")
-            trans = _clean_text(row.get("translation") or row.get("roman") or row.get("colloquial") or "")
-            if trans and len(trans) > 220:
-                trans = trans[:220].rsplit(" ", 1)[0] + "…"
-            label = f"{ch}:{v}"
-            # Title first, then translation; widget will render [C:V] clickable pill
-            line = f"{title} — {trans} [{label}]".strip()
-            lines.append(line)
-            cites.append(label)
-        answer = "\n\n".join(lines) if lines else NO_MATCH_MESSAGE
-        return {
-            "mode": "thematic_list",
-            "answer": answer,
-            "citations": [f"[{c}]" for c in cites[:8]],
-            "suggestions": ["More detail"] + ([f"Explain {c}" for c in cites[:3]] if cites else []),
-            "embeddings_used": False,
-            "debug": {"mode": "thematic_list", "items": len(lines)}
-        }
-
-    # DEFINITION mode? (short terms like “sthita prajna”, “krodha”)
-    if _is_definition_query(q) or (len(q.split()) <= 3):
-        # Use model directly (fast) but ask it to include 2–3 citations
-        system = (
-            "You are a Bhagavad Gita tutor. Define the term from the Gita only. "
-            "Include 2–3 inline verse citations like [chapter:verse] where relevant."
-        )
-        prompt = f"Define briefly and clearly: {q}"
-        try:
-            rsp = client.chat.completions.create(
-                model=GEN_MODEL,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=380,
-            )
-            ans = (rsp.choices[0].message.content or "").strip()
-        except Exception:
-            ans = ""
-
-        # Pull out any [C:V] to surface pills
-        cites = _extract_citations_from_text(ans)
-        return {
-            "mode": "definition",
-            "answer": ans if ans else NO_MATCH_MESSAGE,
-            "citations": [f"[{c}]" for c in cites[:8]],
-            "suggestions": ["More detail", "Show related verses"],
-            "embeddings_used": False,
-            "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
-        }
-
-    # ===================== NEW: canonical Q→A path =====================
-    # Try to answer from the cached canonical questions/answers tables.
+    # ===================== CANONICAL Q→A (FAST PATH) =====================
+    # Check canonical cache BEFORE list/definition/model for instant responses.
     try:
-        # Prefer FTS table if present (questions_fts); fallback to LIKE.
         hit = []
+        # Prefer FTS table if present
         try:
             cur = conn.execute("""
                 SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
@@ -679,7 +615,6 @@ async def ask(payload: AskPayload):
             ans_rows = [dict(r) for r in cur.fetchall()]
 
             if ans_rows:
-                # Combine short/medium/long into one Markdown body.
                 by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
                 parts: List[str] = []
                 if 'short' in by_tier:
@@ -690,7 +625,9 @@ async def ask(payload: AskPayload):
                     parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
                 body = "\n".join(parts).strip()
 
-                # Widget already renders Markdown and turns [C:V] into chips.
+                # Normalize “Chapter 18, Verse 66” → [18:66] (just in case)
+                body = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
+
                 cites = _extract_citations_from_text(body)
                 return {
                     "mode": "canonical",
@@ -701,10 +638,72 @@ async def ask(payload: AskPayload):
                     "embeddings_used": False,
                     "debug": {"mode": "canonical", "qid": qrow["id"]}
                 }
-    except Exception as e:
-        # Don't fail the request if canonical lookup has an issue; just continue.
+    except Exception:
+        # If canonical lookup errors for any reason, continue gracefully.
         pass
-    # =================== END NEW: canonical Q→A path ===================
+    # =================== END CANONICAL FAST PATH ===================
+
+    # ----- Decide broad path: definition vs verse-list vs model-only essay -----
+    # (We still keep FTS for LIST mode; everything else goes model-only by default.)
+    q_expanded = _expand_query(q)
+    fts_rows = search_fts(conn, q_expanded, limit=60)  # give list mode some headroom
+
+    # LIST mode?
+    if _is_verses_listing_query(q):
+        diversified = _diversify_hits(
+            [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows],
+            per_chapter=2, max_total=20, neighbor_radius=1, min_distinct_chapters=3
+        )
+        lines: List[str] = []
+        cites: List[str] = []
+        for ch, v, data in diversified[:20]:
+            row = dict(data)
+            title = _clean_text(row.get("title") or "")
+            trans = _clean_text(row.get("translation") or row.get("roman") or row.get("colloquial") or "")
+            if trans and len(trans) > 220:
+                trans = trans[:220].rsplit(" ", 1)[0] + "…"
+            label = f"{ch}:{v}"
+            line = f"{title} — {trans} [{label}]".strip()
+            lines.append(line)
+            cites.append(label)
+        answer = "\n\n".join(lines) if lines else NO_MATCH_MESSAGE
+        return {
+            "mode": "thematic_list",
+            "answer": answer,
+            "citations": [f"[{c}]" for c in cites[:8]],
+            "suggestions": ["More detail"] + ([f"Explain {c}" for c in cites[:3]] if cites else []),
+            "embeddings_used": False,
+            "debug": {"mode": "thematic_list", "items": len(lines)}
+        }
+
+    # DEFINITION mode? (short terms like “sthita prajna”, “krodha”)
+    if _is_definition_query(q) or (len(q.split()) <= 3):
+        system = (
+            "You are a Bhagavad Gita tutor. Define the term from the Gita only. "
+            "Include 2–3 inline verse citations like [chapter:verse] where relevant."
+        )
+        prompt = f"Define briefly and clearly: {q}"
+        try:
+            rsp = client.chat.completions.create(
+                model=GEN_MODEL,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=380,
+            )
+            ans = (rsp.choices[0].message.content or "").strip()
+        except Exception:
+            ans = ""
+
+        cites = _extract_citations_from_text(ans)
+        return {
+            "mode": "definition",
+            "answer": ans if ans else NO_MATCH_MESSAGE,
+            "citations": [f"[{c}]" for c in cites[:8]],
+            "suggestions": ["More detail", "Show related verses"],
+            "embeddings_used": False,
+            "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
+        }
 
     # MODEL-ONLY essay/explanation (default for thematic questions now)
     ans = _model_answer_guarded(q, max_tokens=700)
