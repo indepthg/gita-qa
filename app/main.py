@@ -326,6 +326,81 @@ def _expand_query(q: str) -> str:
     q2 = q + " OR " + " OR ".join(dict.fromkeys(terms))
     return q2
 
+def _db_rows(sql, params=()):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cur = con.execute(sql, params)
+    out = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return out
+
+# very tolerant detector: "2.47", "2:47", "chapter 2 verse 47"
+_V_RE = re.compile(r'(?:^|\D)(\d{1,2})\s*[:.\-]\s*(\d{1,3})(?:\D|$)', re.I)
+def detect_cv(q: str):
+    if not q: return None
+    m = _V_RE.search(q)
+    if m:
+        ch, v = int(m.group(1)), int(m.group(2))
+        if 1 <= ch <= 18 and 1 <= v <= 200: return ch, v
+    m = re.search(r'chapter\s*(\d{1,2})\D+verse\s*(\d{1,3})', q, re.I)
+    if m:
+        ch, v = int(m.group(1)), int(m.group(2))
+        if 1 <= ch <= 18 and 1 <= v <= 200: return ch, v
+    return None
+
+def qa_find_canonical(q: str):
+    """Return (question_row, answers_rows) or (None, None)."""
+    # Try FTS5 first (if you added questions_fts); otherwise fallback to LIKE
+    try:
+        hit = _db_rows("""
+            SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
+            FROM questions_fts
+            JOIN questions q ON q.id = questions_fts.rowid
+            WHERE questions_fts MATCH ?
+            ORDER BY bm25(questions_fts) ASC, q.priority ASC
+            LIMIT 1
+        """, (q, ))
+    except Exception:
+        hit = []
+    if not hit:
+        hit = _db_rows("""
+            SELECT id, micro_topic_id, intent, priority, question_text
+            FROM questions
+            WHERE question_text LIKE '%'||?||'%'
+            ORDER BY priority ASC, id ASC
+            LIMIT 1
+        """, (q, ))
+    if not hit:
+        return None, None
+    qrow = hit[0]
+    ans = _db_rows("""
+        SELECT length_tier, answer_text
+        FROM answers
+        WHERE question_id=?
+        ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+    """, (qrow["id"],))
+    return qrow, ans
+
+def qa_answers_to_markdown(qrow, ans_rows):
+    """Combine short/medium/long into one Markdown blob (preserves your widget)."""
+    by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
+    parts = []
+    if 'short' in by_tier:
+        parts.append(f"### Short\n{by_tier['short']}")
+    if 'medium' in by_tier:
+        parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
+    if 'long' in by_tier:
+        parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
+    body = "\n".join(parts).strip()
+    # Let widget find verse chips like [2:55]
+    return {
+        "answer": body,
+        "summary": "",           # optional; you can fill later
+        "suggestions": [],       # widget can display pills if you add any
+        "citations": []          # no external links; verse chips are inline
+    }
+
+
 # --- Retrieval diversification ---
 def _diversify_hits(merged: List[Tuple[int, int, Dict]],
                     per_chapter: int = 2,
@@ -564,6 +639,72 @@ async def ask(payload: AskPayload):
             "embeddings_used": False,
             "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
         }
+
+    # ===================== NEW: canonical Q→A path =====================
+    # Try to answer from the cached canonical questions/answers tables.
+    try:
+        # Prefer FTS table if present (questions_fts); fallback to LIKE.
+        hit = []
+        try:
+            cur = conn.execute("""
+                SELECT q.id, q.micro_topic_id, q.intent, q.priority, q.question_text
+                FROM questions_fts
+                JOIN questions q ON q.id = questions_fts.rowid
+                WHERE questions_fts MATCH ?
+                ORDER BY bm25(questions_fts) ASC, q.priority ASC
+                LIMIT 1
+            """, (q,))
+            hit = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            pass
+
+        if not hit:
+            cur = conn.execute("""
+                SELECT id, micro_topic_id, intent, priority, question_text
+                FROM questions
+                WHERE question_text LIKE '%'||?||'%'
+                ORDER BY priority ASC, id ASC
+                LIMIT 1
+            """, (q,))
+            hit = [dict(r) for r in cur.fetchall()]
+
+        if hit:
+            qrow = hit[0]
+            cur = conn.execute("""
+                SELECT length_tier, answer_text
+                FROM answers
+                WHERE question_id=?
+                ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+            """, (qrow["id"],))
+            ans_rows = [dict(r) for r in cur.fetchall()]
+
+            if ans_rows:
+                # Combine short/medium/long into one Markdown body.
+                by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
+                parts: List[str] = []
+                if 'short' in by_tier:
+                    parts.append(f"### Short\n{by_tier['short']}")
+                if 'medium' in by_tier:
+                    parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
+                if 'long' in by_tier:
+                    parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
+                body = "\n".join(parts).strip()
+
+                # Widget already renders Markdown and turns [C:V] into chips.
+                cites = _extract_citations_from_text(body)
+                return {
+                    "mode": "canonical",
+                    "matched_question": qrow.get("question_text"),
+                    "answer": body,
+                    "citations": [f"[{c}]" for c in cites[:8]],
+                    "suggestions": _make_dynamic_suggestions(q, cites[:5]),
+                    "embeddings_used": False,
+                    "debug": {"mode": "canonical", "qid": qrow["id"]}
+                }
+    except Exception as e:
+        # Don't fail the request if canonical lookup has an issue; just continue.
+        pass
+    # =================== END NEW: canonical Q→A path ===================
 
     # MODEL-ONLY essay/explanation (default for thematic questions now)
     ans = _model_answer_guarded(q, max_tokens=700)
