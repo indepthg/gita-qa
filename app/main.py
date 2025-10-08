@@ -575,7 +575,7 @@ async def ask(payload: AskPayload):
         }
 
     # ===================== CANONICAL Q→A (FAST PATH) =====================
-    # Run this BEFORE list/definition/model so seeded topics are instant.
+    # IMPORTANT: this must run BEFORE list/definition/model
     try:
         hit = []
         # Prefer FTS table if present
@@ -593,7 +593,7 @@ async def ask(payload: AskPayload):
             pass
 
         if not hit:
-            # Fallback to LIKE (fast enough on small table)
+            # Fallback to LIKE on questions
             cur = conn.execute("""
                 SELECT id, micro_topic_id, intent, priority, question_text
                 FROM questions
@@ -616,15 +616,12 @@ async def ask(payload: AskPayload):
             if ans_rows:
                 by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
                 parts: List[str] = []
-                if 'short' in by_tier:
-                    parts.append(f"### Short\n{by_tier['short']}")
-                if 'medium' in by_tier:
-                    parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
-                if 'long' in by_tier:
-                    parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
+                if 'short' in by_tier:  parts.append(f"### Short\n{by_tier['short']}")
+                if 'medium' in by_tier: parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
+                if 'long' in by_tier:   parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
                 body = "\n".join(parts).strip()
 
-                # Normalize “Chapter 18, Verse 66” → [18:66] just in case
+                # Normalize any “Chapter 18, Verse 66” → [18:66]
                 body = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
 
                 cites = _extract_citations_from_text(body)
@@ -673,7 +670,7 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "thematic_list", "items": len(lines)}
         }
 
-    # DEFINITION mode (kept, but now AFTER canonical so it won't steal “sthita prajna”)
+    # DEFINITION mode (now AFTER canonical so it won't steal short queries)
     if _is_definition_query(q) or (len(q.split()) <= 3):
         system = (
             "You are a Bhagavad Gita tutor. Define the term from the Gita only. "
