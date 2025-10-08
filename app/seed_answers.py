@@ -1,16 +1,8 @@
-# app/seed_answers.py  — REPLACE ENTIRE FILE
-
+# app/seed_answers.py
 import os, sqlite3
-
 DB_PATH = os.environ.get("DB_PATH", "/data/gita.db")
 
-# Canonical answers in agreed styles:
-# - SHORT/MEDIUM = narrative
-# - LONG = structured only when it helps (varies by topic)
 ANSWERS = {
-  # -------------------------------------------------------
-  # SURRENDER / REFUGE  (micro_topic_id = 1001)
-  # -------------------------------------------------------
   "What does the Gītā mean by surrender to the Lord?": {
     "short": (
       "Surrender (*śaraṇāgati*) is entrusting oneself wholly to Krishna—"
@@ -24,7 +16,6 @@ ANSWERS = {
       "are steadfast in devotion: “I carry what they lack and preserve what they have” [9:22]. "
       "This path is radically inclusive: even those seen as fallen are lifted when devotion is firm [9:31–32]."
     ),
-    # Long = varied structure (not same as sthita-prajña)
     "long": (
       "### In one line\n"
       "Entrust everything to the Divine and act freely—grace carries what the ego cannot.  \n\n"
@@ -77,9 +68,6 @@ ANSWERS = {
     )
   },
 
-  # -------------------------------------------------------
-  # STHITA-PRAJÑA  (micro_topic_id = 1002)
-  # -------------------------------------------------------
   "What is a sthita-prajña in the Bhagavad Gītā?": {
     "short": (
       "A *sthita-prajña* is a person of steady wisdom—free from cravings, even-minded in gain and loss, "
@@ -91,7 +79,6 @@ ANSWERS = {
       "withdraws the senses like a tortoise [2:58]. He moves among objects with discipline, gaining serenity "
       "[2:64–65], and is steady like an ocean filled yet unmoved [2:70]. This is freedom in the midst of life."
     ),
-    # Long = the structured “What / Where / Key Qualities / Essence” you approved
     "long": (
       "### What is a Sthita-prajña?\n"
       "The term means “one of steady wisdom” — a sage whose understanding is firm and not shaken by desire or distress.\n\n"
@@ -151,7 +138,6 @@ SQL_UPD_A    = "UPDATE answers SET answer_text=? WHERE question_id=? AND length_
 def main():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-
     total_ins, total_upd, missing_q = 0, 0, 0
 
     for q_text, tiers in ANSWERS.items():
