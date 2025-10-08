@@ -242,7 +242,7 @@ def debug_canonical(q: str):
 
 # ---------- Helpers ----------
 RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
-CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
+CITE_RE = re.compile(r"\[(\d{1,2}):(\d{1,3})(?:[–-](\d{1,3}))?\]")
 
 def _extract_ch_verse(text: str) -> Optional[Tuple[int, int]]:
     m = RE_CV.search(text or "")
@@ -305,12 +305,19 @@ def _best_text_block(row: Dict[str, Any], force_source: Optional[str] = None) ->
 def _extract_citations_from_text(text: str) -> List[str]:
     out: List[str] = []
     for m in CITE_RE.finditer(text or ""):
-        ch, v = int(m.group(1)), int(m.group(2))
-        if 1 <= ch <= 18 and 1 <= v <= 200:
-            out.append(f"{ch}:{v}")
-    # unique preserving order
-    seen = set()
-    uniq: List[str] = []
+        ch = int(m.group(1))
+        v1 = int(m.group(2))
+        v2 = m.group(3)
+        if v2:
+            v2 = int(v2)
+            # sanity bounds + ascending range
+            if 1 <= ch <= 18 and 1 <= v1 <= 200 and 1 <= v2 <= 200 and v2 >= v1:
+                out.extend([f"{ch}:{v}" for v in range(v1, v2 + 1)])
+        else:
+            if 1 <= ch <= 18 and 1 <= v1 <= 200:
+                out.append(f"{ch}:{v1}")
+    # unique while preserving order
+    seen = set(); uniq = []
     for c in out:
         if c in seen: continue
         seen.add(c); uniq.append(c)
