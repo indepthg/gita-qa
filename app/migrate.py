@@ -24,10 +24,10 @@ CREATE TABLE IF NOT EXISTS answers (
   FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
 );
 
-/* Helpful index for joins/lookups */
+-- Helpful index for joins/lookups
 CREATE INDEX IF NOT EXISTS idx_answers_question_id ON answers(question_id);
 
-/* Optional: simple keyword alias table to help matching (fallback) */
+-- Optional: simple keyword alias table to help matching (fallback)
 CREATE TABLE IF NOT EXISTS question_aliases (
   id INTEGER PRIMARY KEY,
   question_id INTEGER NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS question_aliases (
   FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
 );
 
-/* FTS5 on questions: */
+-- FTS5 on questions:
 CREATE VIRTUAL TABLE IF NOT EXISTS questions_fts
 USING fts5(
   question_text,
@@ -46,7 +46,7 @@ USING fts5(
   content_rowid='id'
 );
 
-/* Triggers to keep FTS in sync */
+-- Triggers to keep FTS in sync
 CREATE TRIGGER IF NOT EXISTS questions_ai AFTER INSERT ON questions BEGIN
   INSERT INTO questions_fts(rowid, question_text, intent, source)
   VALUES (new.id, new.question_text, new.intent, new.source);
@@ -65,9 +65,9 @@ END;
 
 REBUILD_FTS = "INSERT INTO questions_fts(questions_fts) VALUES('rebuild');"
 
-/* ------------------------------------------------------------------ */
-/* Alias seeds (ASCII + diacritics variants → map to canonical Q text) */
-/* ------------------------------------------------------------------ */
+# ------------------------------------------------------------------
+# Alias seeds (ASCII + diacritics variants -> map to canonical Q text)
+# ------------------------------------------------------------------
 ALIASES_MAP = {
   # Chapter 16: Divine / Demoniac
   "What are the divine qualities listed in Chapter 16?": [
