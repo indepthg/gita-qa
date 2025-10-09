@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS answers (
   FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_answers_question_id ON answers(question_id);
+
 /* Optional: simple keyword alias table to help matching (fallback) */
 CREATE TABLE IF NOT EXISTS question_aliases (
   id INTEGER PRIMARY KEY,
