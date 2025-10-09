@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS answers (
 -- Helpful index for joins/lookups
 CREATE INDEX IF NOT EXISTS idx_answers_question_id ON answers(question_id);
 
+-- Ensure no duplicate answers per question/length tier
+CREATE UNIQUE INDEX IF NOT EXISTS uq_answers_qid_tier ON answers(question_id, length_tier);
+
 -- Optional: simple keyword alias table to help matching (fallback)
 CREATE TABLE IF NOT EXISTS question_aliases (
   id INTEGER PRIMARY KEY,
