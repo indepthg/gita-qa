@@ -68,6 +68,28 @@ app.mount("/static", StaticFiles(directory="app"), name="static")
 # --- Boot DB ---
 init_db()
 
+def _clean_text_preserve_lines(t: str) -> str:
+    """Preserve line breaks; remove HTML; avoid flattening to one line."""
+    if not t:
+        return ""
+    t = re.sub(r"(?i)<br\s*/?>", "\n", t)
+    t = re.sub(r"(?is)<p[^>]*>", "", t)
+    t = re.sub(r"(?is)</p>", "\n\n", t)
+    t = re.sub(r"(?is)<[^>]+>", "", t)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n{4,}", "\n\n", t)
+    t = "\n".join(ln.rstrip() for ln in t.split("\n"))
+    return t.strip()
+
+def _normalize_md_answer(md: str) -> str:
+    """Normalize verse mentions and shallow heading levels in model/seeded Markdown."""
+    if not md:
+        return md
+    md = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", md, flags=re.I)
+    md = re.sub(r"^####\s+", "### ", md, flags=re.M)  # collapse too-deep headings
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
+
 # ====================== HTML (unchanged UI) ======================
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -444,33 +466,27 @@ async def ask(payload: AskPayload):
                 "debug": {"mode": "word_meaning"}
             }
 
-        # Explain — WM -> Summary(DB) -> Commentary2 -> Commentary1
+        # EXPLAIN — DB-only (fast), preserve line breaks, show fields in desired order
         neighbors = [dict(n) for n in fetch_neighbors(conn, ch, v, k=1)]
-        c2 = _clean_text(row.get("commentary2") or "")
-        db_summary = _clean_text(row.get("summary") or "")
-        summary = db_summary
-        generated = False
-        if not summary and c2:
-            prompt = (
-                "Summarize the following commentary in 3–5 plain sentences, "
-                "grounded in the text. No markup, no quotes, concise:\n\n" + c2[:3000]
-            )
-            summary = _summarize(prompt, max_tokens=320)
-            generated = True
 
-        return {
+        resp = {
             "mode": "explain",
             "chapter": ch,
             "verse": v,
             "title": row.get("title") or "",
-            "sanskrit": row.get("sanskrit") or "",
-            "roman": row.get("roman") or "",
-            "colloquial": row.get("colloquial") or "",
-            "translation": row.get("translation") or "",
-            "word_meanings": row.get("word_meanings") or "",
-            "summary": summary or "",
-            "commentary2": c2,
-            "commentary1": _clean_text(row.get("commentary1") or ""),
+            "sanskrit": _clean_text_preserve_lines(row.get("sanskrit") or ""),
+            "roman": _clean_text_preserve_lines(row.get("roman") or ""),
+            "colloquial": _clean_text_preserve_lines(row.get("colloquial") or ""),
+            "translation": _clean_text_preserve_lines(row.get("translation") or ""),
+
+            # Summary immediately after translation (no model fallback)
+            "summary": _clean_text_preserve_lines(row.get("summary") or ""),
+
+            # Commentary2 first, then Commentary3 (additional), then Commentary1
+            "commentary2": _clean_text_preserve_lines(row.get("commentary2") or ""),
+            "commentary3": _clean_text_preserve_lines(row.get("commentary3") or ""),
+            "commentary1": _clean_text_preserve_lines(row.get("commentary1") or ""),
+
             "capsule_url": row.get("capsule_url") or "",
             "neighbors": [
                 {"chapter": int(n["chapter"]), "verse": int(n["verse"]), "translation": n.get("translation") or ""}
@@ -479,10 +495,11 @@ async def ask(payload: AskPayload):
             "citations": [f"[{ch}:{v}]"],
             "debug": {
                 "mode": "explain",
-                "used_db_summary": bool(db_summary),
-                "summary_fallback_generated": generated
+                "used_db_summary": bool(row.get("summary")),
+                "summary_fallback_generated": False
             }
         }
+        return resp
 
     # ===== CANONICAL FAST PATH =====
     try:
@@ -520,17 +537,17 @@ async def ask(payload: AskPayload):
             ans_rows = [dict(r) for r in cur.fetchall()]
             if ans_rows:
                 by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
-                parts: List[str] = []
-                if 'short' in by_tier:  parts.append(f"### Short\n{by_tier['short']}")
-                if 'medium' in by_tier: parts.append(f"\n---\n\n### Medium\n{by_tier['medium']}")
-                if 'long' in by_tier:   parts.append(f"\n---\n\n### Long\n{by_tier['long']}")
-                body = "\n".join(parts).strip()
-                body = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
+                # Use Detail (“long”) as the main answer; fall back to Summary (“short”) if needed
+                body = by_tier.get('long') or by_tier.get('short') or ""
+                body = _normalize_md_answer(body)
+                summary = _normalize_md_answer(by_tier.get('short', "")) if 'short' in by_tier else ""
+
                 cites = _extract_citations_from_text(body)
                 return {
                     "mode": "canonical",
                     "matched_question": qrow.get("question_text"),
-                    "answer": body,
+                    "answer": body,           # Detail only (no Short/Medium/Long headings)
+                    "summary": summary,       # optional (widget can show a “Summary” toggle)
                     "citations": [f"[{c}]" for c in cites[:8]],
                     "suggestions": _make_dynamic_suggestions(q, cites[:5]),
                     "embeddings_used": False,
@@ -585,6 +602,7 @@ async def ask(payload: AskPayload):
                 max_tokens=380,
             )
             ans = (rsp.choices[0].message.content or "").strip()
+            ans = _normalize_md_answer(ans)
         except Exception:
             ans = ""
         cites = _extract_citations_from_text(ans)
@@ -599,6 +617,7 @@ async def ask(payload: AskPayload):
 
     # Model-only thematic
     ans = _model_answer_guarded(q, max_tokens=700)
+    ans = _normalize_md_answer(ans)
     if not ans:
         merged = [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows]
         if not merged:
@@ -643,6 +662,7 @@ async def ask(payload: AskPayload):
         ans = _synthesize_structured(q, ctx_lines, min_sections=3, max_sections=4,
                                      target_words_low=350, target_words_high=450,
                                      enforce_diversity_hint=chapters_in_ctx)
+        ans = _normalize_md_answer(ans)
         model_cites = _extract_citations_from_text(ans)
         ordered: List[str] = []
         seen = set()
