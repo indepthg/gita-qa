@@ -1,15 +1,20 @@
-# app/main.py — Gita Q&A (with Canonical Admin: upload + run) for big change 150 qa
+# app/main.py — Gita Q&A v2 (with canonical upload + background generation)
 import os
 import re
+import csv
+import json
+import time
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# --- DB helpers from your project ---
 from .db import (
     get_conn,
     init_db,
@@ -20,11 +25,8 @@ from .db import (
     stats,
     ensure_fts,
 )
-from .ingest import load_sheet_to_rows, ingest_commentary
-from . import embed_store
 
-# === NEW: import the generator ===
-from .generate_canonicals import run_generate
+from .ingest import load_sheet_to_rows, ingest_commentary
 
 # --- Environment ---
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
@@ -34,9 +36,10 @@ NO_MATCH_MESSAGE = os.getenv(
     "I couldn't find enough in the corpus to answer that. Try a specific verse like 12:12, or rephrase your question.",
 )
 TOPIC_DEFAULT = os.getenv("TOPIC_DEFAULT", "gita")
-USE_EMBED = os.getenv("USE_EMBED", "0") == "1"
-RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "gita-krishna")  # <— secure your admin calls
+USE_EMBED = os.getenv("USE_EMBED", "0") == "1"  # kept for compatibility
+RAG_SOURCE = os.getenv("RAG_SOURCE", "").strip().lower()  # e.g. "commentary2"
+DB_PATH = os.environ.get("DB_PATH", "/data/gita.db")
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "gita-krishna") or "").strip()
 
 # --- OpenAI client ---
 from openai import OpenAI
@@ -48,19 +51,15 @@ app = FastAPI(title="Gita Q&A v2")
 if ALLOW_ORIGINS == "*":
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=["*"], allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"],
     )
 else:
     allowed = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allowed, allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"],
     )
 
 # Serve widget.js at /static/widget.js
@@ -69,7 +68,7 @@ app.mount("/static", StaticFiles(directory="app"), name="static")
 # --- Boot DB ---
 init_db()
 
-# ---------- Home (unchanged UI) ----------
+# ====================== HTML (unchanged UI) ======================
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -161,7 +160,7 @@ def home():
 </html>
     """
 
-# ---------- Ingest endpoints ----------
+# ====================== Ingest endpoints ======================
 @app.post("/ingest_sheet_sql")
 async def ingest_sheet_sql(file: UploadFile = File(...)):
     try:
@@ -188,46 +187,7 @@ async def ingest_commentary_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- Admin helpers ----------
-def _require_admin(token: str):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# ---------- Canonicals admin: upload + run ----------
-@app.post("/admin/canonicals/upload")
-async def admin_upload_canonicals(
-    control: UploadFile = File(...),
-    master: UploadFile = File(...),
-    x_admin_token: str = Header(None, convert_underscores=False)
-):
-    _require_admin(x_admin_token)
-    control_path = "/data/control_questions_v3.csv"
-    master_path = "/data/Gita_Master_Index_v1.csv"
-    with open(control_path, "wb") as f:
-        f.write(await control.read())
-    with open(master_path, "wb") as f:
-        f.write(await master.read())
-    return {"saved": {"control": control_path, "master": master_path}}
-
-@app.post("/admin/canonicals/run")
-async def admin_run_canonicals(
-    x_admin_token: str = Header(None, convert_underscores=False),
-    control_path: str = "/data/control_questions_v3.csv",
-    master_path: str = "/data/Gita_Master_Index_v1.csv",
-    sleep_sec: float = 0.6
-):
-    _require_admin(x_admin_token)
-    result = run_generate(control_path, master_path, sleep_sec=sleep_sec)
-    return {"status": "ok", "result": result}
-
-@app.get("/admin/canonicals/ping")
-async def admin_canonicals_ping(
-    x_admin_token: str = Header(None, convert_underscores=False),
-):
-    _require_admin(x_admin_token)
-    return {"ok": True}
-
-# ---------- Lookup & debug ----------
+# ====================== Lookup & debug ======================
 @app.get("/title/{ch}/{v}")
 async def get_title(ch: int, v: int):
     conn = get_conn()
@@ -280,7 +240,7 @@ def debug_canonical(q: str):
         out[qrow["id"]] = {"question": qrow["question_text"], "answers": [dict(r) for r in cur.fetchall()]}
     return out
 
-# ---------- Helpers ----------
+# ====================== Helpers ======================
 RE_CV = re.compile(r"\b([1-9]|1[0-8])[:\. ](\d{1,2})\b")
 CITE_RE = re.compile(r"\[\s*(?:C\s*:\s*)?(\d{1,2})\s*[:.]\s*(\d{1,3})\s*\]")
 
@@ -365,7 +325,7 @@ def _make_dynamic_suggestions(user_q: str, cites: List[str]) -> List[str]:
         sug.append("Practical takeaway")
     return sug[:4]
 
-# --- Light semantic expansion ---
+# --- Light semantic expansion (improves recall) ---
 THEME_EXPAND = {
     "anger": ["anger", "krodha", "wrath", "rage", "ire"],
     "desire": ["desire", "kama", "craving", "longing"],
@@ -374,7 +334,6 @@ THEME_EXPAND = {
     "meditation": ["meditation", "dhyana", "concentration", "mind control"],
     "detachment": ["detachment", "vairagya", "equanimity", "non-attachment"],
 }
-
 def _expand_query(q: str) -> str:
     ql = (q or "").lower()
     terms: List[str] = []
@@ -386,37 +345,13 @@ def _expand_query(q: str) -> str:
     q2 = q + " OR " + " OR ".join(dict.fromkeys(terms))
     return q2
 
-# --- Retrieval diversification ---
-def _diversify_hits(merged: List[Tuple[int, int, Dict]],
-                    per_chapter: int = 2,
-                    max_total: int = 10,
-                    neighbor_radius: int = 1,
-                    min_distinct_chapters: int = 3) -> List[Tuple[int, int, Dict]]:
-    selected: List[Tuple[int, int, Dict]] = []
-    per_ch = defaultdict(int)
-    def is_neighbor(ch: int, v: int) -> bool:
-        for (sch, sv, _) in selected:
-            if ch == sch and abs(v - sv) <= neighbor_radius:
-                return True
-        return False
-    for ch, v, data in merged:
-        if len(selected) >= max_total: break
-        if per_ch[ch] >= per_chapter: continue
-        if is_neighbor(ch, v): continue
-        selected.append((ch, v, data)); per_ch[ch] += 1
-    if len({ch for ch, _, _ in selected}) < min_distinct_chapters:
-        for ch, v, data in merged:
-            if len(selected) >= max_total: break
-            if per_ch[ch] >= per_chapter: continue
-            if any((ch == sch and v == sv) for sch, sv, _ in selected): continue
-            selected.append((ch, v, data)); per_ch[ch] += 1
-    return selected[:max_total]
-
-# --- Model helpers ---
+# --- Model-only answer (fast, nicely formatted, Gita-guarded) ---
 def _model_answer_guarded(question: str, max_tokens: int = 700) -> str:
     system = (
         "You are a Bhagavad Gita tutor. Answer clearly and helpfully, using only the Bhagavad Gita.\n"
-        "Prefer to weave in chapter:verse citations like [2:47]. Use a natural structure.\n"
+        "Prefer to weave in chapter:verse citations like [2:47] whenever you refer to a verse.\n"
+        "Do not cite or rely on other scriptures or external sources.\n"
+        "Use a natural structure (headings, short paragraphs, lists) in plain text.\n"
         "If the question is not answerable from the Gita, say so briefly."
     )
     prompt = f"Question: {question}\n\nRespond as instructed above."
@@ -433,10 +368,8 @@ def _model_answer_guarded(question: str, max_tokens: int = 700) -> str:
         return ""
 
 def _synthesize_structured(question: str, ctx_lines: List[str],
-                           min_sections: int = 3,
-                           max_sections: int = 5,
-                           target_words_low: int = 350,
-                           target_words_high: int = 450,
+                           min_sections: int = 3, max_sections: int = 5,
+                           target_words_low: int = 350, target_words_high: int = 450,
                            enforce_diversity_hint: Optional[List[str]] = None) -> str:
     ctx = "\n".join(ctx_lines)[:8000]
     diversity_hint = ""
@@ -448,11 +381,13 @@ def _synthesize_structured(question: str, ctx_lines: List[str],
     prompt = (
         "You are a Bhagavad Gita assistant. Use ONLY the Context below.\n"
         f"Write a structured answer with {min_sections}–{max_sections} thematic sections.\n"
-        "- 2–4 sentences each, plain text, with [chapter:verse] citations.\n"
+        "- 2–4 sentences each, plain text, with [chapter:verse] citations where used.\n"
         f"- Total ≈ {target_words_low}–{target_words_high} words.\n"
         "- Use only context; do not invent sources.\n"
         f"{diversity_hint}\n"
-        f"Question: {question}\n\nContext:\n{ctx}\n"
+        f"Question: {question}\n\n"
+        "Context (each line = [chapter:verse] prose):\n"
+        f"{ctx}\n"
     )
     try:
         rsp = client.chat.completions.create(
@@ -465,10 +400,11 @@ def _synthesize_structured(question: str, ctx_lines: List[str],
             max_tokens=800,
         )
         return (rsp.choices[0].message.content or "").strip()
-    except Exception:
+    except Exception as e:
+        print("LLM synth failed:", e)
         return ""
 
-# ---------- /ask ----------
+# ====================== /ask (keeps your routing) ======================
 class AskPayload(BaseModel):
     question: str
     topic: Optional[str] = None
@@ -482,7 +418,7 @@ async def ask(payload: AskPayload):
     topic = payload.topic or TOPIC_DEFAULT
     conn = get_conn()
 
-    # ----- Direct verse path (Explain / Word meaning) -----
+    # Direct verse path
     cv = _extract_ch_verse(q)
     if cv:
         ch, v = cv
@@ -508,17 +444,16 @@ async def ask(payload: AskPayload):
                 "debug": {"mode": "word_meaning"}
             }
 
-        # Explain — DB summary first, then synth from commentary2
+        # Explain — WM -> Summary(DB) -> Commentary2 -> Commentary1
         neighbors = [dict(n) for n in fetch_neighbors(conn, ch, v, k=1)]
-
         c2 = _clean_text(row.get("commentary2") or "")
         db_summary = _clean_text(row.get("summary") or "")
         summary = db_summary
         generated = False
         if not summary and c2:
             prompt = (
-                "Summarize the following commentary in 3–5 plain sentences, grounded in the text. "
-                "No markup, no quotes, concise:\n\n" + c2[:3000]
+                "Summarize the following commentary in 3–5 plain sentences, "
+                "grounded in the text. No markup, no quotes, concise:\n\n" + c2[:3000]
             )
             summary = _summarize(prompt, max_tokens=320)
             generated = True
@@ -542,10 +477,14 @@ async def ask(payload: AskPayload):
                 for n in neighbors
             ],
             "citations": [f"[{ch}:{v}]"],
-            "debug": {"mode": "explain", "used_db_summary": bool(db_summary), "summary_fallback_generated": generated}
+            "debug": {
+                "mode": "explain",
+                "used_db_summary": bool(db_summary),
+                "summary_fallback_generated": generated
+            }
         }
 
-    # ===================== CANONICAL FAST PATH =====================
+    # ===== CANONICAL FAST PATH =====
     try:
         hit = []
         try:
@@ -560,7 +499,6 @@ async def ask(payload: AskPayload):
             hit = [dict(r) for r in cur.fetchall()]
         except Exception:
             pass
-
         if not hit:
             cur = conn.execute("""
                 SELECT id, micro_topic_id, intent, priority, question_text
@@ -580,7 +518,6 @@ async def ask(payload: AskPayload):
                 ORDER BY CASE length_tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
             """, (qrow["id"],))
             ans_rows = [dict(r) for r in cur.fetchall()]
-
             if ans_rows:
                 by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
                 parts: List[str] = []
@@ -601,13 +538,11 @@ async def ask(payload: AskPayload):
                 }
     except Exception:
         pass
-    # =================== END CANONICAL FAST PATH ===================
+    # ===== END CANONICAL FAST PATH =====
 
-    # ----- Decide broad path: list vs definition vs model -----
+    # Decide: verse-list?
     q_expanded = _expand_query(q)
     fts_rows = search_fts(conn, q_expanded, limit=60)
-
-    # LIST mode?
     if _is_verses_listing_query(q):
         diversified = _diversify_hits(
             [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows],
@@ -634,7 +569,7 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "thematic_list", "items": len(lines)}
         }
 
-    # DEFINITION mode (after canonical so it won't steal short queries)
+    # Definitions (short terms)
     if _is_definition_query(q) or (len(q.split()) <= 3):
         system = (
             "You are a Bhagavad Gita tutor. Define the term from the Gita only. "
@@ -662,7 +597,7 @@ async def ask(payload: AskPayload):
             "debug": {"mode": "definition", "model_only": True, "cites_found": len(cites)}
         }
 
-    # MODEL-ONLY essay/explanation
+    # Model-only thematic
     ans = _model_answer_guarded(q, max_tokens=700)
     if not ans:
         merged = [(int(r["chapter"]), int(r["verse"]), dict(r)) for r in fts_rows]
@@ -733,3 +668,401 @@ async def ask(payload: AskPayload):
         "embeddings_used": False,
         "debug": {"mode": "model_only"}
     }
+
+# ====================== Retrieval diversification ======================
+def _diversify_hits(merged: List[Tuple[int, int, Dict]],
+                    per_chapter: int = 2,
+                    max_total: int = 10,
+                    neighbor_radius: int = 1,
+                    min_distinct_chapters: int = 3) -> List[Tuple[int, int, Dict]]:
+    selected: List[Tuple[int, int, Dict]] = []
+    per_ch = defaultdict(int)
+    def is_neighbor(ch: int, v: int) -> bool:
+        for (sch, sv, _) in selected:
+            if ch == sch and abs(v - sv) <= neighbor_radius:
+                return True
+        return False
+    for ch, v, data in merged:
+        if len(selected) >= max_total: break
+        if per_ch[ch] >= per_chapter: continue
+        if is_neighbor(ch, v): continue
+        selected.append((ch, v, data)); per_ch[ch] += 1
+    if len({ch for ch, _, _ in selected}) < min_distinct_chapters:
+        for ch, v, data in merged:
+            if len(selected) >= max_total: break
+            if per_ch[ch] >= per_chapter: continue
+            if any((ch == sch and v == sv) for sch, sv, _ in selected): continue
+            selected.append((ch, v, data)); per_ch[ch] += 1
+    return selected[:max_total]
+
+# ====================== Admin auth helper ======================
+def _require_admin(x_admin_token: Optional[str]):
+    given = (x_admin_token or "").strip()
+    if given != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ====================== Admin: ping ======================
+@app.get("/admin/canonicals/ping")
+async def admin_canonicals_ping(
+    x_admin_token: str = Header(None, convert_underscores=False),
+):
+    _require_admin(x_admin_token)
+    return {"ok": True}
+
+# ====================== Admin: upload CSVs ======================
+@app.post("/admin/canonicals/upload")
+async def admin_upload_canonicals(
+    control: UploadFile = File(...),
+    master: UploadFile = File(...),
+    x_admin_token: str = Header(None, convert_underscores=False),
+):
+    _require_admin(x_admin_token)
+    try:
+        os.makedirs("/data", exist_ok=True)
+        control_path = "/data/control_questions_v3.csv"
+        master_path = "/data/Gita_Master_Index_v1.csv"
+        with open(control_path, "wb") as f:
+            f.write(await control.read())
+        with open(master_path, "wb") as f:
+            f.write(await master.read())
+        return {"saved": {"control": control_path, "master": master_path}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ====================== Canonical generation core ======================
+def _parse_whitelist(whitelist: str) -> List[Tuple[int,int]]:
+    # supports "18:66, 9:22, 12:8-12"
+    pairs: List[Tuple[int,int]] = []
+    if not whitelist:
+        return pairs
+    for tok in re.split(r"[,\s]+", whitelist.strip()):
+        if not tok:
+            continue
+        m = re.match(r"^(\d{1,2})[:.](\d{1,3})(?:-(\d{1,3}))?$", tok)
+        if not m: continue
+        ch = int(m.group(1)); v1 = int(m.group(2))
+        v2 = int(m.group(3)) if m.group(3) else v1
+        for v in range(v1, v2+1):
+            if 1 <= ch <= 18 and 1 <= v <= 200:
+                pairs.append((ch, v))
+    # unique preserving order
+    seen = set(); out: List[Tuple[int,int]] = []
+    for p in pairs:
+        if p in seen: continue
+        seen.add(p); out.append(p)
+    return out
+
+def _compose_snippet_context(cv_list: List[Tuple[int,int]], master_lookup: Dict[Tuple[int,int], Dict[str,str]]) -> str:
+    # Build compact context like: [18:66] Translation: ... | Commentary: ...
+    lines: List[str] = []
+    for ch, v in cv_list:
+        row = master_lookup.get((ch, v)) or {}
+        trans = (row.get("translation") or "").strip()
+        comm2 = (row.get("commentary2") or "").strip()
+        bits = []
+        if trans: bits.append(f"Translation: {trans}")
+        if comm2: bits.append(f"Commentary: {comm2}")
+        if bits:
+            joined = " | ".join(bits)
+            lines.append(f"[{ch}:{v}] {joined}")
+    return "\n".join(lines)
+
+def _model_canonical_tiers(question: str, context_snippets: str,
+                           style_hint: str, required_points: str) -> Tuple[str,str,str]:
+    """
+    Ask model for three tiers in **natural varied format**; preserve model layout.
+    We instruct it to output with markers so we can split safely.
+    """
+    system = (
+        "You are a Bhagavad Gita tutor. Answer ONLY from the Bhagavad Gita.\n"
+        "Use [chapter:verse] chips when you cite verses. Vary structure naturally; don't force a template.\n"
+        "Keep Sanskrit words plain ASCII (Krishna, bhakti, guna)."
+    )
+    guide = (
+        "You will produce three tiers:\n"
+        "<<<SHORT>>>\n"
+        "- 2–3 sentences; punchy essence; may include 1–2 verse chips.\n"
+        "<<<MEDIUM>>>\n"
+        "- 3–5 short paragraphs or a bulleted list + brief wrap-up; integrate verse chips.\n"
+        "<<<LONG>>>\n"
+        "- 6–10 paragraphs mixing narrative + bullets where helpful; weave in chips and insights.\n\n"
+        "Answer the user question below. Use ONLY these context snippets; do not invent sources:\n"
+        f"{context_snippets}\n\n"
+        f"Style hint (optional): {style_hint or '—'}\n"
+        f"Required points (optional): {required_points or '—'}\n"
+        "Begin."
+    )
+    try:
+        rsp = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": f"Question: {question}\n\n{guide}"}],
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        text = (rsp.choices[0].message.content or "").strip()
+    except Exception as e:
+        text = ""
+
+    # Split on markers
+    short, medium, long = "", "", ""
+    if "<<<SHORT>>>" in text:
+        parts = re.split(r"<<<(SHORT|MEDIUM|LONG)>>>", text)
+        # parts like ["pre", "SHORT", "...", "MEDIUM", "...", "LONG", "..."]
+        cur = None
+        buf = {"SHORT":"", "MEDIUM":"", "LONG":""}
+        it = iter(parts)
+        first = next(it, "")
+        for tag, content in zip(it, it):
+            buf[tag] = content.strip()
+        short = buf["SHORT"].strip()
+        medium = buf["MEDIUM"].strip()
+        long = buf["LONG"].strip()
+    else:
+        # Fallback: treat whole as medium
+        medium = text
+
+    # Normalize any “Chapter x, Verse y” into [x:y]
+    def normalize(body: str) -> str:
+        return re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", body, flags=re.I)
+
+    return normalize(short), normalize(medium), normalize(long)
+
+def generate_answer_tiers(question: str, verse_whitelist: str,
+                          master_lookup: Dict[Tuple[int,int], Dict[str,str]],
+                          style_hint: str, required_points: str) -> Tuple[str,str,str]:
+    cvs = _parse_whitelist(verse_whitelist)
+    ctx = _compose_snippet_context(cvs, master_lookup)
+    if not ctx:
+        # Degenerate: no snippets — still answer guarded
+        s = _model_answer_guarded(question, max_tokens=420)
+        return s, s, s
+    return _model_canonical_tiers(question, ctx, style_hint, required_points)
+
+# ====================== Admin: synchronous run (legacy) ======================
+@app.post("/admin/canonicals/run")
+async def admin_run_canonicals(
+    x_admin_token: str = Header(None, convert_underscores=False),
+    control_path: str = "/data/control_questions_v3.csv",
+    master_path: str = "/data/Gita_Master_Index_v1.csv",
+    sleep_sec: float = 0.6,
+):
+    _require_admin(x_admin_token)
+    try:
+        with open(control_path, "r", encoding="utf-8") as f:
+            control_rows = list(csv.DictReader(f))
+        with open(master_path, "r", encoding="utf-8") as f:
+            master_rows = list(csv.DictReader(f))
+        # Build lookup
+        master_by_cv = {}
+        for r in master_rows:
+            try:
+                ch = int((r.get("chapter") or "").strip())
+                v  = int((r.get("verse") or "").strip())
+            except Exception:
+                continue
+            master_by_cv[(ch, v)] = {
+                "translation": (r.get("translation") or "").strip(),
+                "commentary2": (r.get("commentary2") or "").strip(),
+            }
+
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        q_new = 0; q_upd = 0; a_ins = 0; a_upd = 0
+        for row in control_rows:
+            q_text = (row.get("question_text") or "").strip()
+            mt_id = int(row.get("micro_topic_id") or 0)
+            whitelist = (row.get("verse_whitelist") or "").strip()
+            style = (row.get("style") or "").strip()
+            req_points = (row.get("required_points") or "").strip()
+
+            short_md, med_md, long_md = generate_answer_tiers(
+                question=q_text,
+                verse_whitelist=whitelist,
+                master_lookup=master_by_cv,
+                style_hint=style,
+                required_points=req_points
+            )
+
+            # Upsert question
+            cur.execute("SELECT id FROM questions WHERE question_text=?", (q_text,))
+            rowq = cur.fetchone()
+            if rowq:
+                qid = rowq["id"]; q_upd += 1
+            else:
+                cur.execute("""
+                    INSERT INTO questions(micro_topic_id, intent, priority, source, question_text)
+                    VALUES(?, 'general', 5, 'seed', ?)
+                """, (mt_id, q_text))
+                qid = cur.lastrowid; q_new += 1
+
+            # Upsert answers
+            for tier, text in (("short", short_md), ("medium", med_md), ("long", long_md)):
+                cur.execute("""
+                    INSERT INTO answers(question_id, length_tier, answer_text)
+                    VALUES(?,?,?)
+                    ON CONFLICT(question_id, length_tier) DO UPDATE SET answer_text=excluded.answer_text
+                """, (qid, tier, text))
+                if cur.rowcount == 1:
+                    a_ins += 1
+                else:
+                    a_upd += 1
+
+            conn.commit()
+            if sleep_sec and sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+        conn.close()
+        return {"status":"ok", "result":{
+            "questions_inserted": q_new, "questions_updated": q_upd,
+            "answers_inserted": a_ins, "answers_updated": a_upd
+        }}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ====================== Admin: background job (start/status/stop) ======================
+JOB = {
+    "running": False,
+    "done": False,
+    "started_at": None,
+    "finished_at": None,
+    "processed": 0,
+    "total": 0,
+    "errors": 0,
+    "last_error": "",
+    "stop": False,
+}
+JOB_LOCK = threading.Lock()
+
+def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float):
+    with JOB_LOCK:
+        JOB.update({
+            "running": True, "done": False, "started_at": time.time(),
+            "finished_at": None, "processed": 0, "errors": 0, "last_error": "", "stop": False
+        })
+    try:
+        with open(control_path, "r", encoding="utf-8") as f:
+            control_rows = list(csv.DictReader(f))
+        with open(master_path, "r", encoding="utf-8") as f:
+            master_rows = list(csv.DictReader(f))
+
+        master_by_cv = {}
+        for r in master_rows:
+            try:
+                ch = int((r.get("chapter") or "").strip())
+                v  = int((r.get("verse") or "").strip())
+            except Exception:
+                continue
+            master_by_cv[(ch, v)] = {
+                "translation": (r.get("translation") or "").strip(),
+                "commentary2": (r.get("commentary2") or "").strip(),
+            }
+
+        total = len(control_rows)
+        with JOB_LOCK:
+            JOB["total"] = total
+
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        for idx, row in enumerate(control_rows, start=1):
+            with JOB_LOCK:
+                if JOB["stop"]:
+                    break
+
+            q_text = (row.get("question_text") or "").strip()
+            mt_id = int(row.get("micro_topic_id") or 0)
+            whitelist = (row.get("verse_whitelist") or "").strip()
+            style = (row.get("style") or "").strip()
+            req_points = (row.get("required_points") or "").strip()
+
+            short_md, med_md, long_md = generate_answer_tiers(
+                question=q_text,
+                verse_whitelist=whitelist,
+                master_lookup=master_by_cv,
+                style_hint=style,
+                required_points=req_points
+            )
+
+            # Upsert question
+            cur.execute("SELECT id FROM questions WHERE question_text=?", (q_text,))
+            rowq = cur.fetchone()
+            if rowq:
+                qid = rowq["id"]
+            else:
+                cur.execute("""
+                    INSERT INTO questions(micro_topic_id, intent, priority, source, question_text)
+                    VALUES(?, 'general', 5, 'seed', ?)
+                """, (mt_id, q_text))
+                qid = cur.lastrowid
+
+            # Upsert answers
+            for tier, text in (("short", short_md), ("medium", med_md), ("long", long_md)):
+                cur.execute("""
+                    INSERT INTO answers(question_id, length_tier, answer_text)
+                    VALUES(?,?,?)
+                    ON CONFLICT(question_id, length_tier) DO UPDATE SET answer_text=excluded.answer_text
+                """, (qid, tier, text))
+            conn.commit()
+
+            with JOB_LOCK:
+                JOB["processed"] = idx
+
+            if sleep_sec and sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+        conn.close()
+    except Exception as e:
+        with JOB_LOCK:
+            JOB["errors"] += 1
+            JOB["last_error"] = str(e)
+    finally:
+        with JOB_LOCK:
+            JOB["running"] = False
+            JOB["done"] = True
+            JOB["finished_at"] = time.time()
+
+@app.post("/admin/canonicals/start")
+async def admin_canonicals_start(
+    x_admin_token: str = Header(None, convert_underscores=False),
+    control_path: str = "/data/control_questions_v3.csv",
+    master_path: str = "/data/Gita_Master_Index_v1.csv",
+    sleep_sec: float = 0.6,
+):
+    _require_admin(x_admin_token)
+    with JOB_LOCK:
+        if JOB["running"]:
+            return {"status": "already_running", "processed": JOB["processed"], "total": JOB["total"]}
+        JOB.update({"stop": False})
+    t = threading.Thread(target=_canonicals_worker, args=(control_path, master_path, sleep_sec), daemon=True)
+    t.start()
+    return {"status": "started"}
+
+@app.get("/admin/canonicals/status")
+async def admin_canonicals_status(
+    x_admin_token: str = Header(None, convert_underscores=False),
+):
+    _require_admin(x_admin_token)
+    with JOB_LOCK:
+        out = dict(JOB)
+    pct = 0.0
+    if out["total"]:
+        pct = round(100.0 * (out["processed"] / float(out["total"])), 2)
+    out["percent"] = pct
+    return out
+
+@app.post("/admin/canonicals/stop")
+async def admin_canonicals_stop(
+    x_admin_token: str = Header(None, convert_underscores=False),
+):
+    _require_admin(x_admin_token)
+    with JOB_LOCK:
+        if not JOB["running"]:
+            return {"status": "not_running"}
+        JOB["stop"] = True
+    return {"status": "stopping"}
