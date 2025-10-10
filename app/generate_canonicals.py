@@ -1,308 +1,138 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Canonical Q&A generator (AI-first, commentary-informed) — with commentary3 (Sethu)
-
-- Reads control CSV: /data/control_questions_v3.csv
-  columns: question_id,question_text,style,whitelist,priority
-  - style ∈ {analytical, explanatory}
-  - whitelist supports ranges like 12:8-12 and single chips like 18:66
-
-- For each row:
-  * expand whitelist chips to concrete (ch,verse) list
-  * fetch translation + commentary2 + commentary3 from SQLite (DB_PATH or /data/gita.db)
-  * build a compact "evidence pack" from commentary2/3 (+translation fallback)
-  * ask the model for DETAIL (>=500 words, aim 700–800) in the requested style
-  * derive SUMMARY (>=100 words, flexible layout)
-  * upsert both into answers table:
-      (question_id, 'long', detail_markdown)
-      (question_id, 'short', summary_markdown)
-
-Env:
-  DB_PATH=/data/gita.db
-  CONTROL_CSV=/data/control_questions_v3.csv
-  OPENAI_API_KEY=...
-  GEN_MODEL=gpt-4o-mini (default)
-  GEN_SLEEP=0.6
-"""
-
-import csv
-import os
+# app/generate_canonicals.py
 import re
-import sqlite3
-import sys
-import time
-from typing import List, Tuple, Dict, Optional
 
-DB_PATH = os.environ.get("DB_PATH", "/data/gita.db")
-CONTROL_CSV = os.environ.get("CONTROL_CSV", "/data/control_questions_v3.csv")
-GEN_MODEL = os.environ.get("GEN_MODEL", "gpt-4o-mini")
-SLEEP_BETWEEN = float(os.environ.get("GEN_SLEEP", "0.6"))
-
-# ---- OpenAI client ----
-try:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-except Exception as e:
-    print("[FATAL] OpenAI client not available:", e, file=sys.stderr)
-    sys.exit(1)
-
-# ---- Regex helpers ----
-CHIP_RE = re.compile(r"\b([1-9]|1[0-8])\s*[:.]\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\b")
-PHRASE_CHAPTER_VERSE = re.compile(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", re.I)
-
-def norm_chips(text: str) -> str:
-    """Normalize 'Chapter X Verse Y' => [X:Y]."""
-    return PHRASE_CHAPTER_VERSE.sub(r"[\1:\2]", text or "")
-
-def expand_whitelist(raw: str) -> List[Tuple[int,int]]:
-    """Expand comma-separated chips, allowing ranges like 12:8-12."""
-    out: List[Tuple[int,int]] = []
-    for part in (raw or "").replace(" ", "").split(","):
-        if not part:
-            continue
-        m = CHIP_RE.search(part)
-        if not m:
-            continue
-        ch = int(m.group(1))
-        v1 = int(m.group(2))
-        v2 = m.group(3)
-        if v2:
-            v2 = int(v2)
-            lo, hi = min(v1, v2), max(v1, v2)
-            out.extend((ch, v) for v in range(lo, hi+1))
-        else:
-            out.append((ch, v1))
-    # dedupe, preserve order
-    seen = set(); uniq = []
-    for ch,v in out:
-        if (ch,v) in seen: continue
-        seen.add((ch,v)); uniq.append((ch,v))
+def _parse_whitelist(whitelist: str):
+    # returns list[(ch, v)], unique, ordered
+    if not whitelist:
+        return []
+    txt = (whitelist or "").strip()
+    txt = txt.replace("–", "-").replace("—", "-")  # normalize dashes
+    toks = re.split(r"[,\s]+", txt)
+    out = []
+    for tok in toks:
+        if not tok: continue
+        m = re.match(r"^(\d{1,2})[:.](\d{1,3})(?:-(\d{1,3}))?$", tok)
+        if not m: continue
+        ch = int(m.group(1)); v1 = int(m.group(2)); v2 = int(m.group(3)) if m.group(3) else v1
+        if v1 > v2: v1, v2 = v2, v1
+        for v in range(v1, v2+1):
+            if 1 <= ch <= 18 and 1 <= v <= 200:
+                out.append((ch, v))
+    seen = set(); uniq=[]
+    for cv in out:
+        if cv in seen: continue
+        seen.add(cv); uniq.append(cv)
     return uniq
 
-def connect_db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
+def _clean(s: str) -> str:
+    if not s: return ""
+    s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def fetch_verse(con: sqlite3.Connection, ch: int, v: int) -> Optional[Dict]:
-    r = con.execute("""
-        SELECT chapter, verse, title, translation, commentary2, commentary3
-        FROM verses
-        WHERE chapter=? AND verse=?
-    """, (ch, v)).fetchone()
-    return dict(r) if r else None
-
-def summarize_to_bullets(text: str, max_bullets: int = 3, max_chars: int = 480) -> List[str]:
-    """Tiny heuristic: carve 1–3 sentence bullets from commentary/translation."""
-    if not text: return []
-    t = re.sub(r"\s+", " ", text).strip()
-    t = t[:max_chars]
-    parts = re.split(r"(?<=[.!?])\s+", t)
-    bullets = []
-    for p in parts:
-        p = p.strip()
-        if len(p) < 30: 
-            continue
-        bullets.append(p)
-        if len(bullets) >= max_bullets:
-            break
-    return bullets
-
-def build_evidence_pack(con: sqlite3.Connection, chips: List[Tuple[int,int]]) -> Tuple[str, List[str]]:
-    """
-    Build compact evidence bullets for the model:
-      - prefer commentary2 + commentary3; fallback to translation
-      - 2–3 bullets per verse if possible
-    Returns (markdown_list, chip_labels)
-    """
+def _compose_context(cv_list, master_lookup):
+    # One compact line per verse, joining available fields.
     lines = []
-    chip_labels = []
-    for ch, v in chips:
-        row = fetch_verse(con, ch, v)
-        if not row: 
-            continue
-        chip = f"{ch}:{v}"
-        chip_labels.append(chip)
+    for ch, v in cv_list:
+        row = master_lookup.get((ch, v), {})
+        trans = _clean(row.get("translation") or "")
+        c2 = _clean(row.get("commentary2") or "")
+        c3 = _clean(row.get("commentary3") or "")
+        bits = []
+        if trans: bits.append(f"Translation: {trans}")
+        if c2:    bits.append(f"Commentary2: {c2}")
+        if c3:    bits.append(f"Commentary3: {c3}")
+        if bits:
+            lines.append(f"[{ch}:{v}] " + " | ".join(bits))
+    return "\n".join(lines)
 
-        trans = (row.get("translation") or "").strip()
-        comm2 = (row.get("commentary2") or "").strip()
-        comm3 = (row.get("commentary3") or "").strip()
+def _normalize_verse_mentions(text: str) -> str:
+    if not text: return ""
+    text = re.sub(r"Chapter\s+(\d{1,2})\s*(?:,|)\s*Verse\s+(\d{1,3})", r"[\1:\2]", text, flags=re.I)
+    text = re.sub(r"\b(\d{1,2})\s*[.:]\s*(\d{1,3})\b", r"[\1:\2]", text)
+    return text.strip()
 
-        combo = " ".join([s for s in (comm2, comm3) if s]) or trans
-        bullets = summarize_to_bullets(combo, max_bullets=3)
-        if not bullets and trans:
-            bullets = summarize_to_bullets(trans, max_bullets=2)
+def _ask_model(client, model, system, user, max_tokens, temperature=0.2):
+    try:
+        rsp = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (rsp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
 
-        if bullets:
-            lines.append(f"- [{chip}] " + bullets[0])
-            for b in bullets[1:]:
-                lines.append(f"  • {b}")
-        else:
-            gist = re.sub(r"\s+", " ", combo or trans)[:200]
-            lines.append(f"- [{chip}] {gist}")
-    return "\n".join(lines), chip_labels
-
-def call_openai_detail(question: str, style: str, whitelist: List[str], evidence_md: str) -> str:
-    style_clause = (
-        "Use an analytical, sectioned style with `###` headings and simple `-` bullets where appropriate."
-        if style.lower().strip() == "analytical"
-        else "Use an explanatory, flowing narrative with a few `###` sub-headings (not too many)."
+def _gen_summary_and_detail(client, model, question, ctx, style_hint, required_points):
+    base_system = (
+        "You are a Bhagavad Gita assistant. Use ONLY the provided context. "
+        "Write clean plain text (Markdown ok), with [chapter:verse] chips. No external sources."
     )
-    system = (
-        "You are a Bhagavad Gita teacher. Answer ONLY from the Gita and from the following notes. "
-        "Keep a single, confident teacherly voice (do not mention any commentators by name). "
-        "Cite verses inline as [chapter:verse] chips. Avoid boilerplate closers."
+    guide = (
+        f"Question: {question}\n\n"
+        f"Style hint (optional): {style_hint or '—'}\n"
+        f"Required points (optional): {required_points or '—'}\n\n"
+        "Context lines (each begins with [C:V]):\n"
+        f"{ctx}\n\n"
+        "Produce two sections:\n"
+        "<<<SUMMARY>>>  • 100–150 words. Natural layout: 1 paragraph OR 2 short paragraphs OR 1 paragraph + ≤4 bullets.\n"
+        "<<<DETAIL>>>   • 700–900 words. Clear sections, short paragraphs, tasteful bullets or sub-headings. "
+        "Weave in [C:V] chips where appropriate. Avoid repetition; keep it flowing.\n"
     )
-    user = f"""
-Question:
-{question}
 
-Allowed verse chips (prefer citing these): {", ".join(f"[{c}]" for c in whitelist)}
+    text = _ask_model(client, model, base_system, guide, max_tokens=1800)
+    summ, detail = "", ""
 
-Reference notes (compact bullets distilled from translation/commentary):
-{evidence_md}
+    if "<<<SUMMARY>>>" in text and "<<<DETAIL>>>" in text:
+        parts = re.split(r"<<<(SUMMARY|DETAIL)>>>", text)
+        buf = {"SUMMARY":"", "DETAIL":""}
+        it = iter(parts)
+        _ = next(it, "")
+        for tag, content in zip(it, it):
+            buf[tag] = content.strip()
+        summ = buf["SUMMARY"].strip()
+        detail = buf["DETAIL"].strip()
+    else:
+        # fallback: first ~150 words as summary, rest as detail
+        words = text.split()
+        summ = " ".join(words[:150])
+        detail = " ".join(words[150:])
 
-Write the DETAIL answer with these rules:
-- {style_clause}
-- Word count: target 700–800; DO NOT go under 500 words.
-- Keep verse chips like [18:66], [12:8] inline.
-- You may include at most two short translation fragments (<= 20 words) where they illuminate.
-- Do NOT name or quote commentators; integrate ideas in your own voice.
-- Keep formatting clean; use only `###` for headings and `-` bullets; no deep nesting.
-"""
-    rsp = client.chat.completions.create(
-        model=GEN_MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        temperature=0.35,
-        max_tokens=1200,
-    )
-    return (rsp.choices[0].message.content or "").strip()
+    summ = _normalize_verse_mentions(summ)
+    detail = _normalize_verse_mentions(detail)
 
-def call_openai_summary(detail_markdown: str) -> str:
-    system = (
-        "You are a concise Bhagavad Gita teacher. Create a short Summary from the given DETAIL answer. "
-        "Preserve meaning and the 2–4 strongest [chapter:verse] chips."
-    )
-    user = f"""
-DETAIL (source):
-{detail_markdown}
+    # If DETAIL too short, try once more with stronger expand cue
+    if len(detail.split()) < 550:
+        expand_guide = guide + "\nYour previous detail was too short. Expand to 700–900 words with clearer sections and examples.\n"
+        text2 = _ask_model(client, model, base_system, expand_guide, max_tokens=2200, temperature=0.25)
+        if "<<<DETAIL>>>" in text2:
+            parts = re.split(r"<<<(SUMMARY|DETAIL)>>>", text2)
+            it = iter(parts); _ = next(it, "")
+            buf = {"SUMMARY":"", "DETAIL":""}
+            for tag, content in zip(it, it):
+                buf[tag] = content.strip()
+            if buf["DETAIL"]:
+                detail = _normalize_verse_mentions(buf["DETAIL"])
 
-Now produce a SUMMARY with these rules:
-- 100–140 words minimum.
-- Layout: either (a) 1 paragraph; or (b) 2 short paragraphs; or (c) 1 short paragraph + a mini bullet list (max 4 bullets).
-- Keep 2–4 of the strongest verse chips like [18:66].
-- Keep a clean teacherly voice; no headings; no deep formatting.
-"""
-    rsp = client.chat.completions.create(
-        model=GEN_MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        temperature=0.35,
-        max_tokens=420,
-    )
-    return (rsp.choices[0].message.content or "").strip()
+    # Ensure MIN floors
+    if len(summ.split()) < 90:
+        summ += "\n\n" + " ".join(detail.split()[:40])
 
-def normalize_markdown(md: str) -> str:
-    if not md: return md
-    md = norm_chips(md)
-    md = re.sub(r"^####\s+", "### ", md, flags=re.M)  # normalize too-deep headings
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
+    return summ.strip(), detail.strip()
 
-def ensure_question_exists(con: sqlite3.Connection, qid: int, qtext: str):
-    con.execute("""
-        INSERT INTO questions(id, micro_topic_id, intent, priority, source, question_text)
-        VALUES(?, 0, 'general', 5, 'seed', ?)
-        ON CONFLICT(id) DO UPDATE SET question_text=excluded.question_text
-    """, (qid, qtext))
+# Public API used by main.py
+def generate_answer_tiers(question, verse_whitelist, master_lookup, style_hint, required_points, client=None, model=None):
+    from openai import OpenAI
+    client = client or OpenAI()
+    model = model or "gpt-4o-mini"
 
-def upsert_answer(con: sqlite3.Connection, qid: int, tier: str, text_md: str):
-    con.execute("""
-        INSERT INTO answers(question_id, length_tier, answer_text)
-        VALUES(?, ?, ?)
-        ON CONFLICT(question_id, length_tier) DO UPDATE SET answer_text=excluded.answer_text
-    """, (qid, tier, text_md))
-
-def main():
-    if not os.path.exists(CONTROL_CSV):
-        print(f"[FATAL] Control CSV not found: {CONTROL_CSV}", file=sys.stderr)
-        sys.exit(1)
-
-    con = connect_db()
-
-    with open(CONTROL_CSV, "r", encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
-
-    total = len(rows)
-    print(f"[info] control rows: {total}")
-
-    for idx, row in enumerate(rows, 1):
-        try:
-            qid = int(row.get("question_id") or 0)
-            qtext = (row.get("question_text") or "").strip()
-            style = (row.get("style") or "explanatory").strip().lower()
-            whitelist_raw = (row.get("whitelist") or "").strip()
-
-            if not qid or not qtext or not whitelist_raw:
-                print(f"[skip] row#{idx}: missing qid/qtext/whitelist")
-                continue
-
-            chips = expand_whitelist(whitelist_raw)
-            if not chips:
-                print(f"[warn] row#{idx} qid={qid}: empty chips after expand for '{whitelist_raw}'")
-                continue
-
-            evidence_md, chip_labels = build_evidence_pack(con, chips)
-
-            ensure_question_exists(con, qid, qtext)
-            con.commit()
-
-            detail = call_openai_detail(qtext, style, chip_labels, evidence_md)
-            detail = normalize_markdown(detail)
-
-            # Expand if too short
-            if len(detail.split()) < 480:
-                system = "Expand while preserving structure, chips, and voice. Do not add filler."
-                user = f"Expand this DETAIL to ~700–800 words (minimum 500) without changing meaning:\n\n{detail}"
-                try:
-                    rsp = client.chat.completions.create(
-                        model=GEN_MODEL,
-                        messages=[{"role": "system", "content": system},
-                                  {"role": "user", "content": user}],
-                        temperature=0.3,
-                        max_tokens=900,
-                    )
-                    expanded = (rsp.choices[0].message.content or "").strip()
-                    if len(expanded.split()) > len(detail.split()):
-                        detail = normalize_markdown(expanded)
-                except Exception:
-                    pass
-
-            summary = call_openai_summary(detail)
-            summary = normalize_markdown(summary)
-
-            if len(summary.split()) < 95:
-                summary += "\n\n" + "In essence, this teaching centers on loving trust, steady remembrance, and offering all results to the Lord [18:66][12:10][3:30]."
-
-            upsert_answer(con, qid, "long", detail)
-            upsert_answer(con, qid, "short", summary)
-            con.commit()
-
-            print(f"[ok] {idx}/{total} qid={qid} chips={len(chips)} style={style} "
-                  f"detail_words~{len(detail.split())} summary_words~{len(summary.split())}")
-
-            time.sleep(SLEEP_BETWEEN)
-
-        except KeyboardInterrupt:
-            print("\n[abort] interrupted by user"); break
-        except Exception as e:
-            print(f"[err] row#{idx} qid={row.get('question_id')} : {e}", file=sys.stderr)
-            # continue
-
-    con.close()
-    print("[done] generation complete")
-
-if __name__ == "__main__":
-    main()
+    cvs = _parse_whitelist(verse_whitelist)
+    ctx = _compose_context(cvs, master_lookup)
+    if not ctx:
+        # no context? degrade gracefully (still try to produce both sections)
+        s, d = _gen_summary_and_detail(client, model, question, "", style_hint, required_points)
+        return s, s, d  # (short/medium unused, long)
+    s, d = _gen_summary_and_detail(client, model, question, ctx, style_hint, required_points)
+    return s, s, d
