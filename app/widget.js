@@ -7,7 +7,7 @@ const GitaWidget = (() => {
     sanskrit:        ["sanskrit"],
     roman:           ["transliteration","roman","english"],
     colloquial:      ["colloquial","simple"],
-    translation:     ["translation","meaning","rendering"],
+    translation:     ["translation","rendering"],
     word_meanings:   ["word meaning","word meanings","word-by-word","word by word","padartha","padārtha"],
     commentary1:     ["shankara","śaṅkara","shankaracharya","commentary 1","commentary1"],
     commentary2:     ["commentary 2","commentary2","modern commentary"],
@@ -45,6 +45,12 @@ const GitaWidget = (() => {
     let q = ' ' + stripAccents(String(raw).toLowerCase()) + ' ';
     q = q.replace(/\s*&\s*/g, ' and ');
     const picked = []; const seen = {};
+    // If user explicitly asks for "word meaning(s)", prefer that field
+    if (/\bword\s*meanings?\b/.test(q)) {
+      seen.word_meanings = 1;
+      picked.push('word_meanings');
+    }
+    
     for (const {syn, field} of __SYNS){
       if (q.indexOf(' '+syn+' ') !== -1) {
         if (field === 'all_commentaries') {
@@ -55,6 +61,10 @@ const GitaWidget = (() => {
           seen[field]=1; picked.push(field);
         }
       }
+    }
+    // If we selected word_meanings, drop any accidental translation match
+    if (seen.word_meanings) {
+      return picked.filter(f => f !== 'translation');
     }
     return picked;
   }
@@ -103,24 +113,24 @@ const GitaWidget = (() => {
     s = s.replace(/(^|\W)\*([^*]+)\*(?=\W|$)/g, (_,pre,i)=>`${pre}<em>${mdEscape(i)}</em>`);
     return s;
   }
-
+  
   function mdToHtml(md){
     const lines = String(md||'').replace(/\r\n?|\u2028|\u2029/g,'\n').split(/\n/);
     let out = [];
     let inUL = false, inOL = false;
-
+  
     function closeLists(){ if(inUL){ out.push('</ul>'); inUL=false; } if(inOL){ out.push('</ol>'); inOL=false; } }
-
+  
     for (let raw of lines){
       let l = raw.trimEnd();
-
-      // keep ordered/unordered list OPEN across single empty lines
+  
+      // BLANK LINE: keep ordered/unordered lists open so numbering doesn't reset.
       if (!l.trim()){
         if (!inUL && !inOL) out.push('<p></p>');
         continue;
       }
-
-      // headings ###, ##, #
+  
+      // Headings
       let hm = /^(#{1,3})\s+(.*)$/.exec(l);
       if (hm){
         closeLists();
@@ -128,36 +138,41 @@ const GitaWidget = (() => {
         out.push(`<h${level}>${mdInline(hm[2])}</h${level}>`);
         continue;
       }
-      // ordered list: 1. foo
-      let om = /^\s*\d+\.\s+(.*)$/.exec(l);
+  
+      // Ordered list: "1. foo" or "1) foo"
+      let om = /^\s*\d+[.)]\s+(.*)$/.exec(l);
       if (om){
         if (!inOL){ closeLists(); out.push('<ol>'); inOL=true; }
         out.push(`<li>${mdInline(om[1])}</li>`);
         continue;
       }
-      // unordered list: -, *
-      let um = /^\s*[-*]\s+(.*)$/.exec(l);
+  
+      // Unordered list: "-", "*" or "•"
+      let um = /^\s*[-*•]\s+(.*)$/.exec(l);
       if (um){
         if (!inUL){ closeLists(); out.push('<ul>'); inUL=true; }
         out.push(`<li>${mdInline(um[1])}</li>`);
         continue;
       }
-      // blockquote
+  
+      // Blockquote
       let bq = /^>\s?(.*)$/.exec(l);
       if (bq){
         closeLists();
         out.push(`<blockquote>${mdInline(bq[1])}</blockquote>`);
         continue;
       }
-      // paragraph
+  
+      // Paragraph
       closeLists();
       out.push(`<p>${mdInline(l)}</p>`);
     }
     closeLists();
-    // collapse empty <p></p>
     return out.join('').replace(/(?:<p>\s*<\/p>)+/g, '');
   }
 
+   
+  
   function renderMarkdown(mdText){
     const div = document.createElement('div');
     div.className = 'md';
