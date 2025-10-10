@@ -507,7 +507,8 @@ async def ask(payload: AskPayload):
             "roman": _clean_text_preserve_lines(row.get("roman") or ""),
             "colloquial": _clean_text_preserve_lines(row.get("colloquial") or ""),
             "translation": _clean_text_preserve_lines(row.get("translation") or ""),
-
+            "word_meanings": _clean_text_preserve_lines(row.get("word_meanings") or ""),
+            
             # Summary immediately after translation (no model fallback)
             "summary": _clean_text_preserve_lines(row.get("summary") or ""),
 
@@ -1070,7 +1071,18 @@ def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float, wi
             control_rows = list(csv.DictReader(f))
         with open(master_path, "r", encoding="utf-8") as f:
             master_rows = list(csv.DictReader(f))
-        # master_by_cv build (unchanged)...
+        # master_by_cv build
+        master_by_cv: Dict[Tuple[int,int], Dict[str,str]] = {}
+        for r in master_rows:
+            try:
+                ch = int((r.get("chapter") or "").strip())
+                v  = int((r.get("verse") or "").strip())
+            except Exception:
+                continue
+            master_by_cv[(ch, v)] = {
+                "translation": (r.get("translation") or "").strip(),
+                "commentary2": (r.get("commentary2") or "").strip(),
+            }
 
         total = len(control_rows)
         with JOB_LOCK:
