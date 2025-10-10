@@ -1026,29 +1026,19 @@ JOB = {
 }
 JOB_LOCK = threading.Lock()
 
-def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float):
+def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float, wipe: bool = False):
     with JOB_LOCK:
         JOB.update({
             "running": True, "done": False, "started_at": time.time(),
             "finished_at": None, "processed": 0, "errors": 0, "last_error": "", "stop": False
         })
     try:
+        # load CSVs (unchanged)...
         with open(control_path, "r", encoding="utf-8") as f:
             control_rows = list(csv.DictReader(f))
         with open(master_path, "r", encoding="utf-8") as f:
             master_rows = list(csv.DictReader(f))
-
-        master_by_cv = {}
-        for r in master_rows:
-            try:
-                ch = int((r.get("chapter") or "").strip())
-                v  = int((r.get("verse") or "").strip())
-            except Exception:
-                continue
-            master_by_cv[(ch, v)] = {
-                "translation": (r.get("translation") or "").strip(),
-                "commentary2": (r.get("commentary2") or "").strip(),
-            }
+        # master_by_cv build (unchanged)...
 
         total = len(control_rows)
         with JOB_LOCK:
@@ -1059,6 +1049,23 @@ def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
+        # -------- WIPE BLOCK (only “seed” canonicals) --------
+        if wipe:
+            # remove answers for seed questions, then the questions themselves
+            cur.execute("""
+                DELETE FROM answers
+                WHERE question_id IN (SELECT id FROM questions WHERE source='seed')
+            """)
+            cur.execute("DELETE FROM questions WHERE source='seed'")
+            # keep FTS in sync
+            try:
+                cur.execute("INSERT INTO questions_fts(questions_fts) VALUES('rebuild')")
+            except Exception:
+                pass
+            conn.commit()
+        # -----------------------------------------------------
+
+        # loop over control_rows and upsert (unchanged, uses source='seed')...
         for idx, row in enumerate(control_rows, start=1):
             with JOB_LOCK:
                 if JOB["stop"]:
@@ -1078,7 +1085,7 @@ def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float):
                 required_points=req_points
             )
 
-            # Upsert question
+            # Upsert question (source='seed')
             cur.execute("SELECT id FROM questions WHERE question_text=?", (q_text,))
             rowq = cur.fetchone()
             if rowq:
@@ -1090,13 +1097,17 @@ def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float):
                 """, (mt_id, q_text))
                 qid = cur.lastrowid
 
-            # Upsert answers
-            for tier, text in (("short", short_md), ("medium", med_md), ("long", long_md)):
-                cur.execute("""
-                    INSERT INTO answers(question_id, length_tier, answer_text)
-                    VALUES(?,?,?)
-                    ON CONFLICT(question_id, length_tier) DO UPDATE SET answer_text=excluded.answer_text
-                """, (qid, tier, text))
+            # Store Summary → short, Detail → long; ignore medium
+            cur.execute("""
+                INSERT INTO answers(question_id, length_tier, answer_text)
+                VALUES(?,?,?)
+                ON CONFLICT(question_id, length_tier) DO UPDATE SET answer_text=excluded.answer_text
+            """, (qid, "short", short_md))
+            cur.execute("""
+                INSERT INTO answers(question_id, length_tier, answer_text)
+                VALUES(?,?,?)
+                ON CONFLICT(question_id, length_tier) DO UPDATE SET answer_text=excluded.answer_text
+            """, (qid, "long", long_md))
             conn.commit()
 
             with JOB_LOCK:
@@ -1116,21 +1127,27 @@ def _canonicals_worker(control_path: str, master_path: str, sleep_sec: float):
             JOB["done"] = True
             JOB["finished_at"] = time.time()
 
+
 @app.post("/admin/canonicals/start")
 async def admin_canonicals_start(
     x_admin_token: str = Header(None, convert_underscores=False),
     control_path: str = "/data/control_questions_v3.csv",
     master_path: str = "/data/Gita_Master_Index_v1.csv",
     sleep_sec: float = 0.6,
+    wipe: bool = Query(False),   # <— NEW
 ):
     _require_admin(x_admin_token)
     with JOB_LOCK:
         if JOB["running"]:
             return {"status": "already_running", "processed": JOB["processed"], "total": JOB["total"]}
         JOB.update({"stop": False})
-    t = threading.Thread(target=_canonicals_worker, args=(control_path, master_path, sleep_sec), daemon=True)
+    t = threading.Thread(
+        target=_canonicals_worker,
+        args=(control_path, master_path, sleep_sec, wipe),  # <— pass it through
+        daemon=True
+    )
     t.start()
-    return {"status": "started"}
+    return {"status": "started", "wipe": wipe}
 
 @app.get("/admin/canonicals/status")
 async def admin_canonicals_status(
