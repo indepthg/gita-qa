@@ -538,22 +538,26 @@ async def ask(payload: AskPayload):
             ans_rows = [dict(r) for r in cur.fetchall()]
             if ans_rows:
                 by_tier = {a['length_tier']: a['answer_text'] for a in ans_rows}
-                # Use Detail (“long”) as the main answer; fall back to Summary (“short”) if needed
-                body = by_tier.get('long') or by_tier.get('short') or ""
-                body = _normalize_md_answer(body)
-                summary = _normalize_md_answer(by_tier.get('short', "")) if 'short' in by_tier else ""
-
-                cites = _extract_citations_from_text(body)
+            
+                # Prefer Detail (long); fall back to Summary (short)
+                detail = by_tier.get("long") or ""
+                summary = by_tier.get("short") or ""
+            
+                detail = _normalize_md_answer(detail)
+                summary = _normalize_md_answer(summary)
+            
+                cites = _extract_citations_from_text(detail)
                 return {
                     "mode": "canonical",
                     "matched_question": qrow.get("question_text"),
-                    "answer": body,           # Detail only (no Short/Medium/Long headings)
-                    "summary": summary,       # optional (widget can show a “Summary” toggle)
+                    "answer": detail,            # Detail only
+                    "summary": summary,          # Short summary
                     "citations": [f"[{c}]" for c in cites[:8]],
                     "suggestions": _make_dynamic_suggestions(q, cites[:5]),
                     "embeddings_used": False,
                     "debug": {"mode": "canonical", "qid": qrow["id"]}
                 }
+
     except Exception:
         pass
     # ===== END CANONICAL FAST PATH =====
