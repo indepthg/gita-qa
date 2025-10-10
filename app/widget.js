@@ -1,4 +1,4 @@
-// Gita Q&A v2 — v2.10 (Explain rendering fixes + Markdown polish)
+// Gita Q&A v2 — v2.10 (Explain fixes, Canonical summary/detail, list numbering)
 const GitaWidget = (() => {
   console.log('[GW] init v2.10');
 
@@ -7,7 +7,7 @@ const GitaWidget = (() => {
     sanskrit:        ["sanskrit"],
     roman:           ["transliteration","roman","english"],
     colloquial:      ["colloquial","simple"],
-    translation:     ["translation","rendering"],
+    translation:     ["translation","meaning","rendering"],
     word_meanings:   ["word meaning","word meanings","word-by-word","word by word","padartha","padārtha"],
     commentary1:     ["shankara","śaṅkara","shankaracharya","commentary 1","commentary1"],
     commentary2:     ["commentary 2","commentary2","modern commentary"],
@@ -45,12 +45,6 @@ const GitaWidget = (() => {
     let q = ' ' + stripAccents(String(raw).toLowerCase()) + ' ';
     q = q.replace(/\s*&\s*/g, ' and ');
     const picked = []; const seen = {};
-    // If user explicitly asks for "word meaning(s)", prefer that field
-    if (/\bword\s*meanings?\b/.test(q)) {
-      seen.word_meanings = 1;
-      picked.push('word_meanings');
-    }
-    
     for (const {syn, field} of __SYNS){
       if (q.indexOf(' '+syn+' ') !== -1) {
         if (field === 'all_commentaries') {
@@ -62,14 +56,9 @@ const GitaWidget = (() => {
         }
       }
     }
-    // If we selected word_meanings, drop any accidental translation match
-    if (seen.word_meanings) {
-      return picked.filter(f => f !== 'translation');
-    }
     return picked;
   }
 
-  // tolerant field picker for backend name variants
   function pickField(obj, key) {
     if (!obj) return '';
     const cap = key.charAt(0).toUpperCase()+key.slice(1);
@@ -101,36 +90,27 @@ const GitaWidget = (() => {
     return '#';
   }
   function mdInline(s){
-    // links [text](url)
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_,txt,href) => {
       return `<a href="${sanitizeUrl(href)}" target="_blank" rel="noopener">${mdEscape(txt)}</a>`;
     });
-    // code `code`
     s = s.replace(/`([^`]+)`/g, (_,code)=>`<code>${mdEscape(code)}</code>`);
-    // bold **text**
     s = s.replace(/\*\*([^*]+)\*\*/g, (_,b)=>`<strong>${mdEscape(b)}</strong>`);
-    // italics *text*
     s = s.replace(/(^|\W)\*([^*]+)\*(?=\W|$)/g, (_,pre,i)=>`${pre}<em>${mdEscape(i)}</em>`);
     return s;
   }
-  
   function mdToHtml(md){
     const lines = String(md||'').replace(/\r\n?|\u2028|\u2029/g,'\n').split(/\n/);
     let out = [];
     let inUL = false, inOL = false;
-  
     function closeLists(){ if(inUL){ out.push('</ul>'); inUL=false; } if(inOL){ out.push('</ol>'); inOL=false; } }
-  
     for (let raw of lines){
       let l = raw.trimEnd();
-  
-      // BLANK LINE: keep ordered/unordered lists open so numbering doesn't reset.
       if (!l.trim()){
-        if (!inUL && !inOL) out.push('<p></p>');
+        closeLists();
+        out.push('<p></p>');
         continue;
       }
-  
-      // Headings
+      // headings
       let hm = /^(#{1,3})\s+(.*)$/.exec(l);
       if (hm){
         closeLists();
@@ -138,41 +118,34 @@ const GitaWidget = (() => {
         out.push(`<h${level}>${mdInline(hm[2])}</h${level}>`);
         continue;
       }
-  
-      // Ordered list: "1. foo" or "1) foo"
+      // ordered list: "1. " or "1) "
       let om = /^\s*\d+[.)]\s+(.*)$/.exec(l);
       if (om){
         if (!inOL){ closeLists(); out.push('<ol>'); inOL=true; }
         out.push(`<li>${mdInline(om[1])}</li>`);
         continue;
       }
-  
-      // Unordered list: "-", "*" or "•"
-      let um = /^\s*[-*•]\s+(.*)$/.exec(l);
+      // unordered list
+      let um = /^\s*[-*]\s+(.*)$/.exec(l);
       if (um){
         if (!inUL){ closeLists(); out.push('<ul>'); inUL=true; }
         out.push(`<li>${mdInline(um[1])}</li>`);
         continue;
       }
-  
-      // Blockquote
+      // blockquote
       let bq = /^>\s?(.*)$/.exec(l);
       if (bq){
         closeLists();
         out.push(`<blockquote>${mdInline(bq[1])}</blockquote>`);
         continue;
       }
-  
-      // Paragraph
+      // paragraph
       closeLists();
       out.push(`<p>${mdInline(l)}</p>`);
     }
     closeLists();
     return out.join('').replace(/(?:<p>\s*<\/p>)+/g, '');
   }
-
-   
-  
   function renderMarkdown(mdText){
     const div = document.createElement('div');
     div.className = 'md';
@@ -351,14 +324,14 @@ const GitaWidget = (() => {
       .gw2 .citations { margin: 6px 0 6px; }
       .gw2 .sect { margin-top: 14px; }
       .gw2 .sect.title { font-weight: 800; }
-      .gw2 .sect.pre { white-space: pre-wrap; } /* preserve line breaks (Sanskrit/Roman/Colloquial) */
+      .gw2 .sect.pre { white-space: pre-wrap; } /* preserve line breaks */
       .gw2 .sect.transl { font-style: italic; }
       .gw2 .wm-inline { margin-top: 12px; }
       .gw2 .wm-key { font-weight: 800; }
       .gw2 .md h1,.gw2 .md h2,.gw2 .md h3{ margin: .6em 0 .3em; line-height:1.25; font-weight: 800; }
       .gw2 .md p{ margin: .5em 0; }
       .gw2 .md ul,.gw2 .md ol{ margin: .5em 1.25em; }
-      .gw2 .md ol{ list-style: decimal; } /* make sure numbers show 1,2,3… */
+      .gw2 .md ol{ list-style: decimal; }
       .gw2 .md code{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .95em; padding: .1em .25em; border:1px solid var(--c-border); border-radius:4px; }
       .gw2 .md a{ color: var(--c-fg); text-decoration: underline; }
       blockquote{ border-left: 3px solid var(--c-border); padding-left: .75em; color: var(--c-muted); margin: .6em 0; }
@@ -392,10 +365,10 @@ const GitaWidget = (() => {
       const msg = el('div', { class: 'msg ' + role });
       const bubble = el('div', { class: 'bubble' });
 
-      // build citation set
+      // Build citation set from visible fields
       let citeSet = new Set(normalizeCitations(extras.citations));
       if (role === 'bot' && content && typeof content === 'object') {
-        ['answer','summary','title','translation','word_meanings','commentary1','commentary2','commentary3','colloquial'].forEach(k => {
+        ['answer','summary','title','translation','word_meanings','commentary1','commentary2','commentary3'].forEach(k => {
           if (content[k]) extractCitationsFromText(content[k]).forEach(cv => citeSet.add(cv));
         });
       } else if (role === 'bot' && typeof content === 'string') {
@@ -413,6 +386,7 @@ const GitaWidget = (() => {
         bubble.textContent = content;
       } else {
         if (content && typeof content === 'object') {
+          const isExplain = Number.isFinite(+content.chapter) && Number.isFinite(+content.verse);
           let any = false;
 
           // Title (no inline-cites)
@@ -424,52 +398,70 @@ const GitaWidget = (() => {
             bubble.appendChild(t);
           }
 
-          // Core verse fields
-          if (content.sanskrit)    { any = true; bubble.appendChild(el('div', { class: 'sect pre' }, toPlain(content.sanskrit))); }
-          if (content.roman)       { any = true; bubble.appendChild(el('div', { class: 'sect pre' }, toPlain(content.roman))); }
-          if (content.colloquial)  { any = true; bubble.appendChild(el('div', { class: 'sect pre' }, toPlain(content.colloquial))); } // pre-wrap
-          if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
+          // ===== Explain (verse) fields =====
+          if (isExplain) {
+            if (content.sanskrit)    { any = true; bubble.appendChild(el('div', { class: 'sect pre' }, toPlain(content.sanskrit))); }
+            if (content.roman)       { any = true; bubble.appendChild(el('div', { class: 'sect pre' }, toPlain(content.roman))); }
+            if (content.colloquial)  { any = true; bubble.appendChild(el('div', { class: 'sect pre' }, toPlain(content.colloquial))); }
+            if (content.translation) { any = true; bubble.appendChild(el('div', { class: 'sect transl' }, toPlain(content.translation))); }
 
-          // SUMMARY — right after translation
-          if (content.summary) {
-            any = true;
-            const cleanedSummary = String(content.summary).replace(/\[C:V\]/g,'');
-            const md = renderMarkdown('**Summary:** ' + cleanedSummary);
-            md.classList.add('sect');
-            bubble.appendChild(md);
+            // Summary (immediately after translation)
+            if (content.summary) {
+              any = true;
+              const cleanedSummary = String(content.summary).replace(/\[C:V\]/g,'');
+              const md = renderMarkdown('**Summary:** ' + cleanedSummary);
+              md.classList.add('sect');
+              bubble.appendChild(md);
+            }
+
+            // Word Meanings
+            if (content.word_meanings) {
+              any = true;
+              bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
+            }
+
+            // Commentary sections
+            if (content.commentary2) {
+              any = true;
+              bubble.appendChild(el('div', { class: 'sect' }, el('strong', {}, 'Commentary:')));
+              const md = renderMarkdown(content.commentary2);
+              md.classList.add('sect');
+              bubble.appendChild(md);
+            }
+            if (content.commentary3) {
+              any = true;
+              bubble.appendChild(el('div', { class: 'sect' }, el('strong', {}, 'Additional Commentary:')));
+              const md = renderMarkdown(content.commentary3);
+              md.classList.add('sect');
+              bubble.appendChild(md);
+            }
+            if (content.commentary1) {
+              any = true;
+              bubble.appendChild(el('div', { class: 'sect' }, el('strong', {}, 'Shankara Commentary:')));
+              const md = renderMarkdown(content.commentary1);
+              md.classList.add('sect');
+              bubble.appendChild(md);
+            }
           }
 
-          // Word meanings
-          if (content.word_meanings) {
+          // ===== Canonical (summary + detail) =====
+          if (!isExplain && (content.answer || content.summary)) {
+            // Show Summary (if present) above Detail
+            if (content.summary) {
+              const md = renderMarkdown(content.summary);
+              md.classList.add('sect');
+              bubble.appendChild(md);
+            }
+            if (content.answer) {
+              const md = renderMarkdown(content.answer);
+              md.classList.add('sect');
+              bubble.appendChild(md);
+            }
             any = true;
-            bubble.appendChild(renderWordMeaningsInline(content.word_meanings));
-          }
-
-          // Commentary sections (Markdown), bold labels
-          if (content.commentary2) {
-            any = true;
-            bubble.appendChild(el('div', { class: 'sect' }, el('strong', {}, 'Commentary:')));
-            const md = renderMarkdown(content.commentary2);
-            md.classList.add('sect');
-            bubble.appendChild(md);
-          }
-          if (content.commentary3) {
-            any = true;
-            bubble.appendChild(el('div', { class: 'sect' }, el('strong', {}, 'Additional Commentary:')));
-            const md = renderMarkdown(content.commentary3);
-            md.classList.add('sect');
-            bubble.appendChild(md);
-          }
-          if (content.commentary1) {
-            any = true;
-            bubble.appendChild(el('div', { class: 'sect' }, el('strong', {}, 'Shankara Commentary:')));
-            const md = renderMarkdown(content.commentary1);
-            md.classList.add('sect');
-            bubble.appendChild(md);
           }
 
           // Fallback: render generic answer if provided
-          const rest = content.answer;
+          const rest = (!isExplain && !content.answer) ? content.answer : '';
           if (!any && rest) {
             const md = renderMarkdown(rest);
             md.classList.add('sect');
@@ -477,6 +469,7 @@ const GitaWidget = (() => {
           }
           if (!any && !rest) bubble.textContent = toPlain(JSON.stringify(content));
         } else {
+          // string answer -> render as Markdown
           const md = renderMarkdown(String(content||''));
           md.classList.add('sect');
           bubble.appendChild(md);
