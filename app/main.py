@@ -83,13 +83,41 @@ def _clean_text_preserve_lines(t: str) -> str:
     return t.strip()
 
 def _normalize_md_answer(md: str) -> str:
-    """Normalize verse mentions and shallow heading levels in model/seeded Markdown."""
+    """
+    Normalize model/seeded Markdown so it renders cleanly:
+    - “Chapter X, Verse Y” -> [X:Y]
+    - Collapse too-deep headings to ### 
+    - Convert 1) … -> 1. … (Markdown OL)
+    - Normalize Unicode bullets (•, ◼, ●, ◦) -> "- "
+    - Trim excessive blank lines
+    """
     if not md:
-        return md
-    md = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", md, flags=re.I)
-    md = re.sub(r"^####\s+", "### ", md, flags=re.M)  # collapse too-deep headings
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
+        return ""
+
+    import re
+
+    t = md
+
+    # Normalize common HTML line breaks if any slipped in
+    t = re.sub(r"<\s*br\s*/?\s*>", "\n", t, flags=re.I)
+
+    # Chapter/Verse -> [X:Y]
+    t = re.sub(r"Chapter\s+(\d+)\s*(?:,|)\s*Verse\s+(\d+)", r"[\1:\2]", t, flags=re.I)
+
+    # Collapse too-deep headings to ### (keep your original behavior)
+    t = re.sub(r"^####\s+", "### ", t, flags=re.M)
+
+    # Turn “1) text” into “1. text” (so OL renders correctly)
+    t = re.sub(r"^\s*(\d+)\)\s+", r"\1. ", t, flags=re.M)
+
+    # Normalize common unicode bullets to "- "
+    t = re.sub(r"^[\u2022\u25AA\u25CF\u25E6]\s+", "- ", t, flags=re.M)
+
+    # Collapse excessive blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t)
+
+    return t.strip()
+
 
 # ====================== HTML (unchanged UI) ======================
 @app.get("/", response_class=HTMLResponse)
