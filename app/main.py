@@ -8,7 +8,8 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header, Query
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header, Query, Body
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -720,6 +721,74 @@ def _require_admin(x_admin_token: Optional[str]):
     given = (x_admin_token or "").strip()
     if given != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ====================== Admin: ad-hoc SQL (read-only) ======================
+@app.post("/admin/sql")
+async def admin_sql(
+    sql: str = Body(..., media_type="text/plain"),
+    x_admin_token: str = Header(None, convert_underscores=False),
+):
+    """
+    Minimal read-only SQL runner.
+    - Requires admin token.
+    - Allows only SELECT / EXPLAIN / PRAGMA (read-only) single statement.
+    - Returns rows as JSON (columns + rows).
+    """
+    _require_admin(x_admin_token)
+
+    q = (sql or "").strip().strip(";")
+    if not q:
+        raise HTTPException(status_code=400, detail="Empty SQL")
+
+    # Basic safety: only allow read-only statements
+    low = q.lower()
+    if not (low.startswith("select") or low.startswith("explain") or low.startswith("pragma")):
+        raise HTTPException(status_code=400, detail="Only SELECT/EXPLAIN/PRAGMA allowed")
+
+    # Disallow multiple statements
+    if ";" in q:
+        raise HTTPException(status_code=400, detail="Only a single statement is allowed")
+
+    try:
+        conn = get_conn()
+        conn.row_factory = None  # we’ll build dicts manually using cursor.description
+        cur = conn.execute(q)
+        cols = [c[0] for c in cur.description] if cur.description else []
+        rows_raw = cur.fetchall() if cur.description else []
+        rows = [dict(zip(cols, r)) for r in rows_raw]
+        return {
+            "sql": q,
+            "columns": cols,
+            "rowcount": len(rows),
+            "rows": rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"SQL error: {e}")
+
+
+# ====================== Debug: verse summary peek ======================
+@app.get("/debug/summary/{ch}/{v}")
+async def debug_summary(ch: int, v: int):
+    """
+    Convenience endpoint to quickly see the 'summary' column for a verse.
+    No auth required. Read-only.
+    """
+    try:
+        conn = get_conn()
+        conn.row_factory = None
+        cur = conn.execute(
+            "SELECT chapter, verse, summary FROM verses WHERE chapter=? AND verse=?",
+            (ch, v),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"chapter": ch, "verse": v, "summary": None}
+        cols = [c[0] for c in cur.description]
+        data = dict(zip(cols, row))
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ====================== Admin: ping ======================
 @app.get("/admin/canonicals/ping")
