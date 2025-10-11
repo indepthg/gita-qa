@@ -701,20 +701,28 @@ async def admin_upload_canonicals(
 
 # ====================== Database download ======================
 
-@app.get("/admin/download-db")
-def download_db(x_admin_token: str = Header(None)):
-    assert_admin(x_admin_token)  # Reuses your existing admin security
-    # DB_PATH should already be imported or accessible in this file
-    return FileResponse(DB_PATH, filename="gita.db")
-
-# --- TEMP: secure DB download (remove after use) ---
+# --- TEMP: DB debug + download (remove after use) ---
+from fastapi import Header
 from fastapi.responses import FileResponse
+import os, sqlite3, time
+
+@app.get("/admin/debug-db-path")
+def debug_db_path(x_admin_token: str = Header(None)):
+    assert_admin(x_admin_token)
+    p = DB_PATH
+    return {"DB_PATH": p, "exists": os.path.exists(p), "size_bytes": os.path.getsize(p) if os.path.exists(p) else 0}
 
 @app.get("/admin/download-db")
 def download_db(x_admin_token: str = Header(None)):
-    assert_admin(x_admin_token)  # uses your existing admin guard
-    # DB_PATH must already be defined (env or module-level)
-    return FileResponse(DB_PATH, filename="gita.db")
+    assert_admin(x_admin_token)
+    src = DB_PATH
+    tmp = f"/tmp/gita-export-{int(time.time())}.db"
+    con = sqlite3.connect(src)
+    try:
+        con.execute(f"VACUUM main INTO '{tmp}';")
+    finally:
+        con.close()
+    return FileResponse(tmp, filename="gita.db")
 # --- /TEMP ---
 
 # ====================== Canonical generation core ======================
