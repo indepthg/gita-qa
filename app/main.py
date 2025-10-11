@@ -699,6 +699,14 @@ async def admin_upload_canonicals(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ====================== Database download ======================
+
+@app.get("/admin/download-db")
+def download_db(x_admin_token: str = Header(None)):
+    assert_admin(x_admin_token)  # Reuses your existing admin security
+    # DB_PATH should already be imported or accessible in this file
+    return FileResponse(DB_PATH, filename="gita.db")
+
 # ====================== Canonical generation core ======================
 def _parse_whitelist(whitelist: str) -> List[Tuple[int,int]]:
     pairs: List[Tuple[int,int]] = []
