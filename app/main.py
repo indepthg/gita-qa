@@ -707,6 +707,16 @@ def download_db(x_admin_token: str = Header(None)):
     # DB_PATH should already be imported or accessible in this file
     return FileResponse(DB_PATH, filename="gita.db")
 
+# --- TEMP: secure DB download (remove after use) ---
+from fastapi.responses import FileResponse
+
+@app.get("/admin/download-db")
+def download_db(x_admin_token: str = Header(None)):
+    assert_admin(x_admin_token)  # uses your existing admin guard
+    # DB_PATH must already be defined (env or module-level)
+    return FileResponse(DB_PATH, filename="gita.db")
+# --- /TEMP ---
+
 # ====================== Canonical generation core ======================
 def _parse_whitelist(whitelist: str) -> List[Tuple[int,int]]:
     pairs: List[Tuple[int,int]] = []
